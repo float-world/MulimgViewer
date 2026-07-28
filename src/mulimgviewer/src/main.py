@@ -2317,7 +2317,11 @@ class MulimgViewer (MulimgViewerGui):
                 self.ImgManager.subtract()
             self.shared_config.batch_idx = max(0, self.ImgManager.action_count)
 
-        self.show_img_init()
+        #self.show_img_init()
+        #
+        if not getattr(self, "_from_timer", False):
+            self.show_img_init()
+
         self.show_img()
         self.SetStatusText_(["Last", "-1", "-1", "-1"])
 
@@ -3834,8 +3838,9 @@ class MulimgViewer (MulimgViewerGui):
 
             self.SetStatusText_(["Stitch", "-1", "-1", "-1"])
             self.position = [0, 0]
-            self.scrolledWindow_img.Scroll(0, 0)
-            wx.CallAfter(self.scrolledWindow_img.Scroll, 0, 0)
+            #self.scrolledWindow_img.Scroll(0, 0)
+            #wx.CallAfter(self.scrolledWindow_img.Scroll, 0, 0)
+            # 删除上面两行 ★ display_bitmap 内部已处理 Scroll + CallAfter，此处不重复调用
             return
 
         if self.ImgManager.max_action_num > 0:
@@ -4113,6 +4118,108 @@ class MulimgViewer (MulimgViewerGui):
 
         return pil_img, 0
 
+    #b3 修改3：display_bitmap —— 移除 Thaw 后多余的 Refresh，以及视频播放时跳过重复 layout
+    # def display_bitmap(self, video_mode, pil_img):
+    #     dbg_batch = int(getattr(self.shared_config, "batch_idx", -1))
+    #
+    #     if pil_img is None and video_mode:
+    #         cache = getattr(self.shared_config, "cache_img", [])
+    #         b = int(getattr(self.shared_config, "batch_idx", 0))
+    #         if not (0 <= b < len(cache)) or cache[b] is None:
+    #             return
+    #         pil_img = cache[b]
+    #
+    #     try:
+    #         if video_mode and pil_img is not None:
+    #             arr = np.array(pil_img.convert("RGBA"), dtype=np.uint8)
+    #
+    #             bg_rgb = np.array(self.ImgManager.gap_color[:3], dtype=np.int16)
+    #             rgb = arr[:, :, :3].astype(np.int16)
+    #             alpha = arr[:, :, 3].astype(np.int16)
+    #
+    #             tol = 6
+    #             alpha_min = 8
+    #
+    #             diff = np.max(np.abs(rgb - bg_rgb), axis=2)
+    #             content = (diff > tol) & (alpha > alpha_min)
+    #
+    #             if np.any(content):
+    #                 h, w = content.shape
+    #                 row_hits = content.sum(axis=1)
+    #                 col_hits = content.sum(axis=0)
+    #
+    #                 row_thr = max(12, int(w * 0.01))
+    #                 col_thr = max(12, int(h * 0.01))
+    #
+    #                 ys_thr = np.where(row_hits > row_thr)[0]
+    #                 xs_thr = np.where(col_hits > col_thr)[0]
+    #
+    #                 ys_any = np.where(content.any(axis=1))[0]
+    #                 xs_any = np.where(content.any(axis=0))[0]
+    #
+    #                 if ys_any.size > 0 and xs_any.size > 0:
+    #                     y0 = int(ys_thr[0]) if ys_thr.size > 0 else int(ys_any[0])
+    #                     x0 = int(xs_thr[0]) if xs_thr.size > 0 else int(xs_any[0])
+    #
+    #                     y1 = int(ys_any[-1]) + 1
+    #                     x1 = int(xs_any[-1]) + 1
+    #
+    #                     arr = arr[y0:y1, x0:x1]
+    #                     pil_img = Image.fromarray(arr, mode="RGBA")
+    #     except Exception:
+    #         pass
+    #
+    #     bmp = self.ImgManager.ImgF.PIL2wx(pil_img)
+    #     self._set_placeholder_visible(False)
+    #
+    #     if hasattr(self, "img_last") and self.img_last:
+    #         self.img_last.SetBitmap(bmp)
+    #     else:
+    #         self.img_last = wx.StaticBitmap(self.img_panel, bitmap=bmp)
+    #     self._ensure_img_bindings()
+    #
+    #     if not hasattr(self, "img_panel_sizer"):
+    #         self.img_panel_sizer = wx.BoxSizer(wx.VERTICAL)
+    #         self.img_panel.SetSizer(self.img_panel_sizer)
+    #     else:
+    #         try:
+    #             self.img_panel_sizer.Clear(False)
+    #         except Exception:
+    #             pass
+    #
+    #     self.img_panel_sizer.Add(self.img_last, 0, wx.ALIGN_LEFT | wx.ALIGN_TOP, 0)
+    #
+    #     # Key fix: use PIL logical size for layout, not bmp.GetSize() HiDPI physical pixels
+    #     logical_w, logical_h = pil_img.size
+    #     logical_size = wx.Size(int(logical_w), int(logical_h))
+    #
+    #     self.img_last.SetPosition((0, 0))
+    #     self.img_last.SetSize(logical_size)
+    #     self.img_last.SetMinSize(logical_size)
+    #
+    #     self.img_panel.SetPosition((0, 0))
+    #     self.img_panel.SetSize(logical_size)
+    #     self.img_panel.SetMinSize(logical_size)
+    #
+    #     try:
+    #         self.scrolledWindow_img.Freeze()
+    #     except Exception:
+    #         pass
+    #
+    #     self.img_panel.Layout()
+    #     self.scrolledWindow_img.Layout()
+    #     self.scrolledWindow_img.SetVirtualSize(logical_size)
+    #     self.scrolledWindow_img.Scroll(0, 0)
+    #     self.position = [0, 0]
+    #
+    #     try:
+    #         self.scrolledWindow_img.Thaw()
+    #     except Exception:
+    #         pass
+    #
+    #     wx.CallAfter(self.scrolledWindow_img.Scroll, 0, 0)
+    #     self.scrolledWindow_img.Refresh()
+
     def display_bitmap(self, video_mode, pil_img):
         dbg_batch = int(getattr(self.shared_config, "batch_idx", -1))
 
@@ -4126,40 +4233,44 @@ class MulimgViewer (MulimgViewerGui):
         try:
             if video_mode and pil_img is not None:
                 arr = np.array(pil_img.convert("RGBA"), dtype=np.uint8)
-
                 bg_rgb = np.array(self.ImgManager.gap_color[:3], dtype=np.int16)
                 rgb = arr[:, :, :3].astype(np.int16)
                 alpha = arr[:, :, 3].astype(np.int16)
-
                 tol = 6
                 alpha_min = 8
-
                 diff = np.max(np.abs(rgb - bg_rgb), axis=2)
                 content = (diff > tol) & (alpha > alpha_min)
-
                 if np.any(content):
                     h, w = content.shape
                     row_hits = content.sum(axis=1)
                     col_hits = content.sum(axis=0)
-
                     row_thr = max(12, int(w * 0.01))
                     col_thr = max(12, int(h * 0.01))
-
                     ys_thr = np.where(row_hits > row_thr)[0]
                     xs_thr = np.where(col_hits > col_thr)[0]
-
                     ys_any = np.where(content.any(axis=1))[0]
                     xs_any = np.where(content.any(axis=0))[0]
-
                     if ys_any.size > 0 and xs_any.size > 0:
                         y0 = int(ys_thr[0]) if ys_thr.size > 0 else int(ys_any[0])
                         x0 = int(xs_thr[0]) if xs_thr.size > 0 else int(xs_any[0])
-
                         y1 = int(ys_any[-1]) + 1
                         x1 = int(xs_any[-1]) + 1
-
                         arr = arr[y0:y1, x0:x1]
                         pil_img = Image.fromarray(arr, mode="RGBA")
+        except Exception:
+            pass
+
+        logical_w, logical_h = pil_img.size
+        logical_size = wx.Size(int(logical_w), int(logical_h))
+
+        # ★ 判断尺寸是否变化，不变则跳过整个 sizer/layout 重建
+        last_size = getattr(self, "_last_display_logical_size", None)
+        size_changed = (last_size != logical_size)
+        self._last_display_logical_size = logical_size
+
+        # ★ Freeze 必须在一切 layout 操作之前，否则无效
+        try:
+            self.scrolledWindow_img.Freeze()
         except Exception:
             pass
 
@@ -4170,49 +4281,42 @@ class MulimgViewer (MulimgViewerGui):
             self.img_last.SetBitmap(bmp)
         else:
             self.img_last = wx.StaticBitmap(self.img_panel, bitmap=bmp)
+            size_changed = True  # 新控件必须走一次完整 layout
         self._ensure_img_bindings()
 
-        if not hasattr(self, "img_panel_sizer"):
-            self.img_panel_sizer = wx.BoxSizer(wx.VERTICAL)
-            self.img_panel.SetSizer(self.img_panel_sizer)
-        else:
-            try:
-                self.img_panel_sizer.Clear(False)
-            except Exception:
-                pass
+        if size_changed:
+            # 只在尺寸变化时才重建 sizer 和 layout
+            if not hasattr(self, "img_panel_sizer"):
+                self.img_panel_sizer = wx.BoxSizer(wx.VERTICAL)
+                self.img_panel.SetSizer(self.img_panel_sizer)
+            else:
+                try:
+                    self.img_panel_sizer.Clear(False)
+                except Exception:
+                    pass
+            self.img_panel_sizer.Add(self.img_last, 0, wx.ALIGN_LEFT | wx.ALIGN_TOP, 0)
 
-        self.img_panel_sizer.Add(self.img_last, 0, wx.ALIGN_LEFT | wx.ALIGN_TOP, 0)
+            self.img_last.SetPosition((0, 0))
+            self.img_last.SetSize(logical_size)
+            self.img_last.SetMinSize(logical_size)
 
-        # Key fix: use PIL logical size for layout, not bmp.GetSize() HiDPI physical pixels
-        logical_w, logical_h = pil_img.size
-        logical_size = wx.Size(int(logical_w), int(logical_h))
+            self.img_panel.SetPosition((0, 0))
+            self.img_panel.SetSize(logical_size)
+            self.img_panel.SetMinSize(logical_size)
 
-        self.img_last.SetPosition((0, 0))
-        self.img_last.SetSize(logical_size)
-        self.img_last.SetMinSize(logical_size)
+            self.img_panel.Layout()
+            self.scrolledWindow_img.Layout()
+            self.scrolledWindow_img.SetVirtualSize(logical_size)
+            self.scrolledWindow_img.Scroll(0, 0)
 
-        self.img_panel.SetPosition((0, 0))
-        self.img_panel.SetSize(logical_size)
-        self.img_panel.SetMinSize(logical_size)
-
-        try:
-            self.scrolledWindow_img.Freeze()
-        except Exception:
-            pass
-
-        self.img_panel.Layout()
-        self.scrolledWindow_img.Layout()
-        self.scrolledWindow_img.SetVirtualSize(logical_size)
-        self.scrolledWindow_img.Scroll(0, 0)
         self.position = [0, 0]
 
         try:
             self.scrolledWindow_img.Thaw()
         except Exception:
             pass
-
-        wx.CallAfter(self.scrolledWindow_img.Scroll, 0, 0)
-        self.scrolledWindow_img.Refresh()
+        # ★ 删除 Refresh()：Thaw() 本身触发延迟重绘，再调 Refresh() 造成第二次绘制
+        # ★ 删除 CallAfter(Scroll, 0,0)：show_img 里已有此调用，不需要在这里重复
 
     def auto_layout(self, frame_resize=False):
         displays = (wx.Display(i) for i in range(wx.Display.GetCount()))
@@ -4730,6 +4834,7 @@ def main(img_list, save_path, name_list=None, algorithm_name="{algorithm_name}")
             self.show_all_func.SetValue(False)
         self._invalidate_render_cache()
 
+    #b3 修改1：next_img 和 last_img —— timer 播放时跳过 show_img_init
     def next_img(self, event):
         if self.shared_config.video_mode and self.shared_config.is_playing and not getattr(self, "_from_timer", False):
             self.shared_config.play_direction = 1
@@ -4774,7 +4879,11 @@ def main(img_list, save_path, name_list=None, algorithm_name="{algorithm_name}")
         self.shared_config.batch_idx = min(self.shared_config.batch_idx, self.ImgManager.max_action_num - 1)
         if not self.shared_config.video_mode:
             self.shared_config.batch_idx = min(self.ImgManager.action_count, self.ImgManager.max_action_num - 1)
-        self.show_img_init()
+        #self.show_img_init()
+        # ★ timer驱动时跳过 layout 重建，只有用户手动操作才重建
+        if not getattr(self, "_from_timer", False):
+            self.show_img_init()
+
         self.show_img()
         self.SetStatusText_(["Next", "-1", "-1", "-1"])
 
