@@ -133,9 +133,11 @@ class SharedConfig:
         self.cache_img = [] #Position to store stitched images
         self.image_cache_img = [] #Image mode stitch cache False
         self.image_cache_paths = [] #Image mode cache path list
-        self.debug_video = False #Video mode debug output
+        #self.debug_video = False #Video mode debug output
         self.debug_image = False #Image mode debug output
-        self.debug_thread = False #Thread debug output
+        #self.debug_thread = False #Thread debug output
+        self.debug_thread = True
+        self.debug_video = True
         self.interval_recommend = None #Playback interval recommendation
         self.video_last_message = "" # Most recent video error/diagnostic information
 
@@ -759,14 +761,42 @@ class VideoManager:
         extract_threads = getattr(self.executor, "_max_workers", 0)
         stitch_threads = getattr(self.stitch_executor, "_max_workers", 0)
 
+        ##b3 ←旧代码，全部同步，stitch_executor 完全没用上
+        # for t in range(window_start, window_end + 1):
+        #     for vid, max_b in enumerate(max_batches):
+        #         if max_b <= 0 or t >= max_b:
+        #             continue
+        #         wait_for_extract = (t <= stitch_limit)
+        #         self._ensure_batch_extracted(vid, t, wait=wait_for_extract)
+        #     if t <= stitch_limit and cache[t] is None:
+        #         self._stitch_batch_multi(t)
+
         for t in range(window_start, window_end + 1):
+            # t > global_b 且在 stitch_limit 内 → 预取批次，走异步
+            is_prefetch = (t > global_b and t <= stitch_limit)
+
+            # ── 提取阶段 ──────────────────────────────────────────────
+            extract_futs_for_t = []
             for vid, max_b in enumerate(max_batches):
                 if max_b <= 0 or t >= max_b:
                     continue
-                wait_for_extract = (t <= stitch_limit)
-                self._ensure_batch_extracted(vid, t, wait=wait_for_extract)
+                if is_prefetch:
+                    # 异步提取：返回 Future 供后续拼接任务等待
+                    fut = self._ensure_batch_extracted(vid, t, wait=False)
+                    if hasattr(fut, "result"):  # 是 Future 才收集
+                        extract_futs_for_t.append(fut)
+                else:
+                    # 当前帧 / 已经过的帧：同步等待提取完毕
+                    self._ensure_batch_extracted(vid, t, wait=True)
+
+            # ── 拼接阶段 ──────────────────────────────────────────────
             if t <= stitch_limit and cache[t] is None:
-                self._stitch_batch_multi(t)
+                if is_prefetch:
+                    # 预取：交给stitch_executor 异步拼接
+                    self._schedule_stitch_multi(t, extract_futs_for_t)
+                else:
+                    # 当前帧 / 历史帧：同步拼接，保证立即可用
+                    self._stitch_batch_multi(t)
 
         for vid, max_b in enumerate(max_batches):
             if max_b <= 0:
@@ -1266,6 +1296,59 @@ class VideoManager:
             if getattr(self.shared_config, "debug_thread", False):
                 print(f"Stitch thread count: {stitch_threads}")
             self._reported_stitch_threads = True
+        self.stitch_executor.submit(_task)
+
+    #b2 在 VideoManager 类中添加新方法
+    def _schedule_extract_stitch_multi(self, global_b: int, vid_max_batches: list):
+        """异步提取 global_b 批次的所有视频帧，然后拼接。"""
+        if not self._should_schedule_stitch(global_b):
+            return
+
+        def _task():
+            try:
+                # 在 stitch worker 线程内依次等待各视频帧提取完成
+                for vid, _max_b in vid_max_batches:
+                    self._ensure_batch_extracted(vid, global_b, wait=True)
+                # 仍需拼接则执行
+                if self._should_schedule_stitch(global_b):
+                    self._stitch_batch_multi(global_b)
+            except Exception as ex:
+                self._debug_video(f"[StitchMulti] async error batch={global_b} error={ex}")
+            finally:
+                with self._pending_lock:
+                    self._pending_stitch_async = max(0, self._pending_stitch_async - 1)
+
+        with self._pending_lock:
+            self._pending_stitch_async += 1
+        self.stitch_executor.submit(_task)
+
+    def _schedule_stitch_multi(self, global_b: int, extract_futs: list):
+        """
+        Schedule async multi-video stitching for batch global_b.
+        extract_futs: list of Future objects for in-progress extractions.Waits for all futures to finish, then calls _stitch_batch_multi.
+        """
+        if not self._should_schedule_stitch(global_b):
+            return
+
+        def _task():
+            try:
+                # Wait for all pending extraction futures before stitching
+                for fut in extract_futs:
+                    try:
+                        fut.result()
+                    except Exception:
+                        pass
+                # Only stitch if cache slot is still empty
+                if self._should_schedule_stitch(global_b):
+                    self._stitch_batch_multi(global_b)
+            except Exception as ex:
+                self._debug_video(f"[StitchMulti] async error batch={global_b} error={ex}")
+            finally:
+                with self._pending_lock:
+                    self._pending_stitch_async = max(0, self._pending_stitch_async - 1)
+
+        with self._pending_lock:
+            self._pending_stitch_async += 1
         self.stitch_executor.submit(_task)
 
     def _stitch_batch_multi(self, global_b: int):
