@@ -1680,8 +1680,20 @@ class MulimgViewer (MulimgViewerGui):
             # Entering image mode: initialize image stitch pool
             self._init_image_stitch_executor()
 
+    # def on_interval_changed(self, event):
+    #     self.shared_config.interval = float(self.m_textCtrl28.GetValue() or 1.0)
+    #b1 修改
     def on_interval_changed(self, event):
-        self.shared_config.interval = float(self.m_textCtrl28.GetValue() or 1.0)
+        try:
+            new_interval = max(0.05, float(self.m_textCtrl28.GetValue() or 1.0))
+        except (ValueError, TypeError):
+            new_interval = 1.0
+        self.shared_config.interval = new_interval
+        #★ 播放中修改 interval 时，立即重启 timer 使新值生效
+        if getattr(self.shared_config, "is_playing", False):
+            self.play_timer.Stop()
+            self.play_timer.Start(int(new_interval * 1000), oneShot=False)
+        event.Skip()
 
     def toggle_play(self, event):
         self.shared_config.is_playing = not self.shared_config.is_playing
