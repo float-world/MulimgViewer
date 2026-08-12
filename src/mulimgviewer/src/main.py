@@ -969,8 +969,9 @@ class VideoManager:
         step = self.shared_config.skip_frames + 1
         start_time = time.time()
         cache_dir = self.shared_config.video_path[video_idx]
-        target_size = 256
-        enable_debug_scale = bool(getattr(self.shared_config, "debug_video", False))
+        #b4 修改  去掉这个缩放耦合，让抽帧永远保持原始分辨率
+        #target_size = 256
+        #enable_debug_scale = bool(getattr(self.shared_config, "debug_video", False))
         last_error = None
         has_ffmpeg_input = callable(getattr(ffmpeg, "input", None))
 
@@ -1040,13 +1041,21 @@ class VideoManager:
                 tmp_tpl = os.path.join(cache_dir, f'__tmp_{video_idx}_{suffix}_%d.jpeg')
 
                 try:
+                    # stream = (
+                    #     ffmpeg
+                    #     .input(str(video_path))
+                    #     .filter('select', sel)
+                    # )
+                    # if enable_debug_scale:
+                    #     stream = stream.filter('scale', target_size, -1, force_original_aspect_ratio='decrease')
+
+                    #b4 修改
+
                     stream = (
                         ffmpeg
                         .input(str(video_path))
                         .filter('select', sel)
                     )
-                    if enable_debug_scale:
-                        stream = stream.filter('scale', target_size, -1, force_original_aspect_ratio='decrease')
 
                     (
                         stream
