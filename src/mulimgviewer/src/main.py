@@ -683,10 +683,12 @@ class VideoManager:
                 if 0 <= global_t < len(self.shared_config.cache_img):
                     self.shared_config.cache_img[global_t] = None
 
-        for t in range(window_start, local_b):
+        # 1. 当前帧和历史帧：同步拼接
+        for t in range(window_start, local_b + 1):  # 包括当前帧
             self._ensure_batch_extracted(video_idx, t, wait=True)
             if t <= stitch_end:
                 global_t = (base_global + t) if parallel_to_seq else t
+                # ★ 强制同步拼接（确保当前帧可用）
                 if self.shared_config.cache_img[global_t] is None:
                     self._stitch_batch(video_idx, t, global_t)
 
@@ -696,6 +698,7 @@ class VideoManager:
             if force_rebuild_window or self.shared_config.cache_img[global_local] is None:
                 self._stitch_batch(video_idx, local_b, global_local)
 
+        # 2. 未来帧：异步预取
         for t in range(local_b + 1, extract_end + 1):
             global_t = (base_global + t) if parallel_to_seq else t
             async_prefetch = (t <= stitch_end)
@@ -761,7 +764,7 @@ class VideoManager:
         extract_threads = getattr(self.executor, "_max_workers", 0)
         stitch_threads = getattr(self.stitch_executor, "_max_workers", 0)
 
-        ##b3 ←旧代码，全部同步，stitch_executor 完全没用上
+        ##b3 ←旧代码，全部同步，stitch_executor 完全没用上     b5
         # for t in range(window_start, window_end + 1):
         #     for vid, max_b in enumerate(max_batches):
         #         if max_b <= 0 or t >= max_b:
@@ -772,31 +775,31 @@ class VideoManager:
         #         self._stitch_batch_multi(t)
 
         for t in range(window_start, window_end + 1):
-            # t > global_b 且在 stitch_limit 内 → 预取批次，走异步
-            is_prefetch = (t > global_b and t <= stitch_limit)
+            is_current_or_past = (t <= global_batch)
+            is_prefetch = (t > global_batch and t <= stitch_limit)
 
-            # ── 提取阶段 ──────────────────────────────────────────────
+            # 1. 提取阶段
             extract_futs_for_t = []
             for vid, max_b in enumerate(max_batches):
                 if max_b <= 0 or t >= max_b:
                     continue
-                if is_prefetch:
-                    # 异步提取：返回 Future 供后续拼接任务等待
-                    fut = self._ensure_batch_extracted(vid, t, wait=False)
-                    if hasattr(fut, "result"):  # 是 Future 才收集
-                        extract_futs_for_t.append(fut)
-                else:
-                    # 当前帧 / 已经过的帧：同步等待提取完毕
+                if is_current_or_past:
+                    # ★ 当前帧/历史帧：同步等待
                     self._ensure_batch_extracted(vid, t, wait=True)
-
-            # ── 拼接阶段 ──────────────────────────────────────────────
-            if t <= stitch_limit and cache[t] is None:
-                if is_prefetch:
-                    # 预取：交给stitch_executor 异步拼接
-                    self._schedule_stitch_multi(t, extract_futs_for_t)
                 else:
-                    # 当前帧 / 历史帧：同步拼接，保证立即可用
+                    # 未来帧：异步提取
+                    fut = self._ensure_batch_extracted(vid, t, wait=False)
+                    if hasattr(fut, "result"):
+                        extract_futs_for_t.append(fut)
+
+            # 2. 拼接阶段
+            if t <= stitch_limit and cache[t] is None:
+                if is_current_or_past:
+                    # ★ 当前帧/历史帧：同步拼接
                     self._stitch_batch_multi(t)
+                else:
+                    # 未来帧：异步拼接
+                    self._schedule_stitch_multi(t, extract_futs_for_t)
 
         for vid, max_b in enumerate(max_batches):
             if max_b <= 0:
@@ -1851,6 +1854,61 @@ class MulimgViewer (MulimgViewerGui):
                 except Exception:
                     pass
 
+    def _suspend_play_timer_for_wait(self):
+        """暂停播放 timer，防止等待拼接期间继续前进/跳帧"""
+        if getattr(self, "_play_timer_suspended", False):
+            return
+        self._play_timer_suspended = True
+        try:
+            self.play_timer.Stop()
+        except Exception:
+            pass
+
+    def _resume_play_timer_after_wait(self):
+        """恢复播放 timer"""
+        if not getattr(self, "_play_timer_suspended", False):
+            return
+        self._play_timer_suspended = False
+        if getattr(self.shared_config, "is_playing", False):
+            try:
+                interval_ms = int(self.shared_config.play_interval * 1000)
+                self.play_timer.Start(interval_ms)
+            except Exception:
+                pass
+
+    def _schedule_frame_wait_retry(self, target_batch: int, retry_ms: int = 80):
+        """短暂延迟后重新检查目标帧是否就绪，不改变 batch_idx，不跳帧"""
+        self._cancel_pending_frame_wait()
+
+        def _check():
+            self._pending_frame_wait_timer = None
+            if not getattr(self.shared_config, "is_playing", False):
+                return
+            if int(self.shared_config.batch_idx) != target_batch:
+                # 用户在等待期间手动切换了帧，放弃本次等待
+                self._resume_play_timer_after_wait()
+                return
+
+            cache = self.shared_config.cache_img
+            if 0 <= target_batch < len(cache) and cache[target_batch] is not None:
+                # 目标帧终于就绪，恢复播放并展示
+                self._resume_play_timer_after_wait()
+                self.show_img()
+            else:
+                # 仍未就绪，继续轮询等待（不跳帧）
+                self._schedule_frame_wait_retry(target_batch, retry_ms)
+
+        self._pending_frame_wait_timer = wx.CallLater(retry_ms, _check)
+
+    def _cancel_pending_frame_wait(self):
+        t = getattr(self, "_pending_frame_wait_timer", None)
+        if t is not None:
+            try:
+                t.Stop()
+            except Exception:
+                pass
+            self._pending_frame_wait_timer = None
+
     def _init_image_stitch_executor(self):
         """Initialize the image-mode stitch pool (fixed single worker)."""
         if self.image_stitch_executor is None:
@@ -2361,10 +2419,11 @@ class MulimgViewer (MulimgViewerGui):
             self.UpdateUI(1, input_path, self.parallel_to_sequential.Value)
         self.SetStatusText_(["Input", "-1", "-1", "-1"])
 
+    #b5
     def last_img(self, event):
         if self.shared_config.video_mode and self.shared_config.is_playing and not getattr(self, "_from_timer", False):
             self.shared_config.play_direction = -1
-            self.last_direction = self.shared_config.play_direction  # Keep this existing line for behavior consistency
+            self.last_direction = self.shared_config.play_direction
             return
         if (not self.shared_config.video_mode and
                 self.shared_config.is_playing and
@@ -2372,6 +2431,7 @@ class MulimgViewer (MulimgViewerGui):
             self.shared_config.play_direction = -1
             self.last_direction = -1
             return
+
         if self.shared_config.batch_idx <= 0:
             if getattr(self.shared_config, "is_playing", False):
                 self.shared_config.is_playing = False
@@ -2393,6 +2453,8 @@ class MulimgViewer (MulimgViewerGui):
                 self.last_direction = self.shared_config.play_direction
             if self.shared_config.batch_idx > 0:
                 self.shared_config.batch_idx -= 1
+
+            # ★ 关键：先更新缓存，再展示
             self.video_manager.update_cache()
 
         if self.shared_config.video_mode:
@@ -2409,8 +2471,6 @@ class MulimgViewer (MulimgViewerGui):
                 self.ImgManager.subtract()
             self.shared_config.batch_idx = max(0, self.ImgManager.action_count)
 
-        #self.show_img_init()
-        #
         if not getattr(self, "_from_timer", False):
             self.show_img_init()
 
@@ -3840,71 +3900,24 @@ class MulimgViewer (MulimgViewerGui):
     def show_img(self):
         self._setup_img_panel()
 
-        # Video mode: always read from cache_img[b]; do not stitch on demand
+        # ========== 视频模式 ==========
         if getattr(self.shared_config, "video_mode", False):
             b = int(self.shared_config.batch_idx)
 
-            # If this batch is not stitched yet, wait briefly or stitch synchronously
-            if b >= len(self.shared_config.cache_img) or self.shared_config.cache_img[b] is None:
-                vm = getattr(self, "video_manager", None)
-                if vm:
-                    # Wait for async stitching to complete (up to 5 seconds)
-                    max_wait = 5.0
-                    start = time.time()
-                    while (b >= len(self.shared_config.cache_img) or
-                           self.shared_config.cache_img[b] is None) and \
-                          (time.time() - start < max_wait):
-                        time.sleep(0.05)
-
-                    # If still missing, force synchronous stitching for current batch
-                    if b >= len(self.shared_config.cache_img) or self.shared_config.cache_img[b] is None:
-                        parallel_to_seq = getattr(self.shared_config, "parallel_to_sequential", False)
-                        video_paths = getattr(self.shared_config, "video_path", [])
-
-                        if len(video_paths) > 1 and not parallel_to_seq:
-                            # Multi-video mode
-                            count_per_action = max(1, int(self.shared_config.count_per_action or 1))
-                            for i, num in enumerate(self.shared_config.video_num_list):
-                                n_i = int(num or 0)
-                                max_b_i = (n_i + count_per_action - 1) // count_per_action if n_i > 0 else 0
-                                if b < max_b_i:
-                                    try:
-                                        vm._ensure_batch_extracted(i, b, wait=True)
-                                    except Exception as ex:
-                                        self.shared_config.video_last_message = f"Video extract failed: {ex}"
-                                        self.SetStatusText_(["-1", "-1", f"***Video extract failed: {ex}***", "-1"])
-                            vm._stitch_batch_multi(b)
-                        elif len(video_paths) == 1 or parallel_to_seq:
-                            # Single-video or parallel-to-sequential mode
-                            video_idx = 0
-                            local_b = b
-                            if parallel_to_seq and len(video_paths) > 1:
-                                # Compute which video owns the current batch
-                                count_per_action = max(1, int(self.shared_config.count_per_action or 1))
-                                cum = 0
-                                for i, num in enumerate(self.shared_config.video_num_list):
-                                    max_b_i = (int(num) + count_per_action - 1) // count_per_action
-                                    if b < cum + max_b_i:
-                                        video_idx = i
-                                        local_b = b - cum
-                                        break
-                                    cum += max_b_i
-                            try:
-                                vm._ensure_batch_extracted(video_idx, local_b, wait=True)
-                            except Exception as ex:
-                                self.shared_config.video_last_message = f"Video extract failed: {ex}"
-                                self.SetStatusText_(["-1", "-1", f"***Video extract failed: {ex}***", "-1"])
-                            vm._stitch_batch(video_idx, local_b, b)
-
+            # ★ 关键改动：不再强制同步拼接，只展示已完成的缓存
             if 0 <= b < len(self.shared_config.cache_img) and self.shared_config.cache_img[b] is not None:
                 pil_img = self.shared_config.cache_img[b]
                 self.shared_config.video_last_message = ""
+
+                # 记录渲染时间（用于性能监控）
                 if getattr(self.shared_config, "is_playing", False):
                     vm = getattr(self, "video_manager", None)
                     if vm:
                         vm.perf_monitor.push_render_event()
+
                 self.display_bitmap(True, pil_img)
-                # Status bar/slider update (helps indicate current position)
+
+                # 更新状态栏和滑块
                 try:
                     max_batches = self.ImgManager.max_action_num
                     if getattr(self.shared_config, "parallel_to_sequential", False):
@@ -3920,54 +3933,74 @@ class MulimgViewer (MulimgViewerGui):
                     self.slider_value_max.SetLabel(str(max(0, max_batches - 1)))
                 except:
                     pass
+
+                # ★ 帧已展示成功，取消任何等待中的重试
+                self._cancel_pending_frame_wait()
             else:
+                # ★ 当前帧未就绪：不跳帧，暂停前进，等待后重试
                 msg = str(getattr(self.shared_config, "video_last_message", "") or "").strip()
-                if msg:
-                    self.SetStatusText_(["-1", "-1", f"***{msg}***", "-1"])
-                    print(f"[VideoStatus] {msg}")
-                else:
-                    self.SetStatusText_(["-1", "-1", "***Waiting...***", "-1"])
+                if not msg:
+                    msg = f"Buffering frame {b}..."
+                self.SetStatusText_(["-1", "-1", f"***{msg}***", "-1"])
+
+                if getattr(self.shared_config, "is_playing", False):
+                    # 暂停 timer 的前进节奏，避免在等待期间继续触发 next/last
+                    self._suspend_play_timer_for_wait()
+                    self._schedule_frame_wait_retry(b)
 
             self.SetStatusText_(["Stitch", "-1", "-1", "-1"])
             self.position = [0, 0]
-            #self.scrolledWindow_img.Scroll(0, 0)
-            #wx.CallAfter(self.scrolledWindow_img.Scroll, 0, 0)
-            # 删除上面两行 ★ display_bitmap 内部已处理 Scroll + CallAfter，此处不重复调用
             return
 
+        # ========== 图片模式 ==========
         if self.ImgManager.max_action_num > 0:
-            current_batch = max(0, min(int(getattr(self.shared_config, "batch_idx", 0)), self.ImgManager.max_action_num - 1))
+            current_batch = max(0, min(int(getattr(self.shared_config, "batch_idx", 0)),
+                                       self.ImgManager.max_action_num - 1))
 
             self.slider_img.SetMax(self.ImgManager.max_action_num - 1)
             self.slider_img.SetValue(current_batch)
             self.slider_value.SetValue(str(current_batch))
             self.slider_value_max.SetLabel(str(self.ImgManager.max_action_num - 1))
 
-            with self._image_stitch_lock:
-                flist = self._get_image_flist(current_batch)
-                pil_img = None
-                flag = 1
-                if flist:
-                    self.ImgManager.set_action_count(current_batch)
-                    self.ImgManager.img_count = current_batch * self.ImgManager.count_per_action
-                    pil_img, flag = self.compose_current_frame(batch_idx=current_batch, flist=flist)
+            # ★ 关键改动：调用预取逻辑
+            self._update_image_cache(current_batch)
+
+            # ★ 改动：优先从缓存读取
+            cache_list = self.shared_config.image_cache_img
+            if 0 <= current_batch < len(cache_list) and cache_list[current_batch] is not None:
+                # 缓存命中：直接使用
+                pil_img = cache_list[current_batch]
+                flag = 0
+                flist = self.shared_config.image_cache_paths[current_batch] if current_batch < len(
+                    self.shared_config.image_cache_paths) else None
+            else:
+                # 缓存未命中：同步拼接当前帧（这是当前帧，必须同步）
+                with self._image_stitch_lock:
+                    flist = self._get_image_flist(current_batch)
+                    pil_img = None
+                    flag = 1
+                    if flist:
+                        self.ImgManager.set_action_count(current_batch)
+                        self.ImgManager.img_count = current_batch * self.ImgManager.count_per_action
+                        pil_img, flag = self.compose_current_frame(batch_idx=current_batch, flist=flist)
 
             if pil_img is not None and flag == 0:
                 self.show_bmp_in_panel = pil_img
                 self.img_size = pil_img.size
                 self.display_bitmap(False, pil_img)
 
-                # Update ImgManager state for UI use
+                # 更新 ImgManager 状态
                 self.ImgManager.action_count = current_batch
                 self.ImgManager.img_count = current_batch * self.ImgManager.count_per_action
-                self.ImgManager.flist = flist
-                self.current_page_img_paths = copy.deepcopy(flist)
+                if flist:
+                    self.ImgManager.flist = flist
+                    self.current_page_img_paths = copy.deepcopy(flist)
 
                 if self.ImgManager.type in (2, 3):
                     try:
                         self.SetStatusText_([
                             "-1",
-                            f"{current_batch}/{self.ImgManager.max_action_num-1}",
+                            f"{current_batch}/{self.ImgManager.max_action_num - 1}",
                             f"{self.ImgManager.img_resolution[0]}x{self.ImgManager.img_resolution[1]} pixels / "
                             f"{self.ImgManager.name_list[self.ImgManager.img_count]}"
                             f"-{self.ImgManager.name_list[self.ImgManager.img_count + self.ImgManager.count_per_action - 1]}",
@@ -4001,6 +4034,7 @@ class MulimgViewer (MulimgViewerGui):
             if orig_flist is not None:
                 self.ImgManager.flist = orig_flist
 
+    #b5
     def _update_image_cache(self, batch_idx: int):
         max_batch = self.ImgManager.max_action_num - 1
         if max_batch < 0:
@@ -4022,12 +4056,11 @@ class MulimgViewer (MulimgViewerGui):
         orig_img_count = getattr(self.ImgManager, "img_count", 0)
         orig_flist = getattr(self.ImgManager, "flist", None)
 
-        # Ensure the image stitch pool is initialized
         if self.image_stitch_executor is None:
             self._init_image_stitch_executor()
 
         try:
-            # Process current batch synchronously so it's immediately available
+            # ★ 改动：当前帧同步拼接（确保立即可用）
             if cache_list[batch_idx] is None:
                 with self._image_stitch_lock:
                     flist = self._get_image_flist(batch_idx)
@@ -4036,22 +4069,23 @@ class MulimgViewer (MulimgViewerGui):
                         self.ImgManager.img_count = batch_idx * self.ImgManager.count_per_action
                         pil_img, flag = self.compose_current_frame(batch_idx=batch_idx, flist=flist)
                         if flag == 0:
+                            cache_list[batch_idx] = pil_img
                             path_list[batch_idx] = flist
                             self._debug_image(f"[ImageCache] sync write batch={batch_idx}")
                         else:
                             cache_list[batch_idx] = None
                             path_list[batch_idx] = None
 
-            # Pre-stitch other batches asynchronously via thread pool
+            # 其他帧异步预取
             for t in range(window_start, window_end + 1):
-                if t == batch_idx:  # Current batch is already handled
+                if t == batch_idx:
                     continue
                 if cache_list[t] is None:
                     self.image_stitch_executor.submit(
                         self._stitch_image_batch, t, cache_list, path_list
                     )
 
-            # Clear cache outside the active window
+            # 清理窗口外的缓存
             for idx in range(len(cache_list)):
                 if idx < window_start or idx > window_end:
                     cache_list[idx] = None
@@ -4926,7 +4960,7 @@ def main(img_list, save_path, name_list=None, algorithm_name="{algorithm_name}")
             self.show_all_func.SetValue(False)
         self._invalidate_render_cache()
 
-    #b3 修改1：next_img 和 last_img —— timer 播放时跳过 show_img_init
+    #b3 修改1：next_img 和 last_img —— timer 播放时跳过 show_img_init    b5
     def next_img(self, event):
         if self.shared_config.video_mode and self.shared_config.is_playing and not getattr(self, "_from_timer", False):
             self.shared_config.play_direction = 1
@@ -4939,11 +4973,9 @@ def main(img_list, save_path, name_list=None, algorithm_name="{algorithm_name}")
             self.last_direction = 1
             return
 
-        # Check whether the last batch has been reached
         max_batch_idx = self.ImgManager.max_action_num - 1
         if self.shared_config.batch_idx >= max_batch_idx:
             if getattr(self.shared_config, "is_playing", False):
-                # Stop playback
                 self.shared_config.is_playing = False
                 try:
                     self.play_timer.Stop()
@@ -4963,6 +4995,8 @@ def main(img_list, save_path, name_list=None, algorithm_name="{algorithm_name}")
             self.last_direction = self.shared_config.play_direction
             if self.shared_config.batch_idx < int(self.ImgManager.img_num) - 1:
                 self.shared_config.batch_idx += 1
+
+            # ★ 关键：先更新缓存，再展示
             self.video_manager.update_cache()
 
         if getattr(self.ImgManager, "img_count", 0) < int(self.ImgManager.img_num) - 1:
@@ -4971,8 +5005,7 @@ def main(img_list, save_path, name_list=None, algorithm_name="{algorithm_name}")
         self.shared_config.batch_idx = min(self.shared_config.batch_idx, self.ImgManager.max_action_num - 1)
         if not self.shared_config.video_mode:
             self.shared_config.batch_idx = min(self.ImgManager.action_count, self.ImgManager.max_action_num - 1)
-        #self.show_img_init()
-        # ★ timer驱动时跳过 layout 重建，只有用户手动操作才重建
+
         if not getattr(self, "_from_timer", False):
             self.show_img_init()
 
