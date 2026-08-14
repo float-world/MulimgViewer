@@ -147,6 +147,9 @@ class VideoManager:
         self.shared_config = shared_config
         self.ImgManager = ImgManager
         self.cache_dir = Path("Video_frames")
+        # 新增：磁盘缓存目录
+        self.disk_cache_dir = Path("Video_frames") / "stitch_cache"
+        self.disk_cache_dir.mkdir(parents=True, exist_ok=True)
         self.perf_monitor = PerformanceMonitor()
         self.executor = None
         self.stitch_executor = None
@@ -168,6 +171,49 @@ class VideoManager:
         self._reported_extract_threads = False
         self._reported_stitch_threads = False
         self._initialize_thread_pools()
+
+
+    def _get_disk_cache_path(self, batch_idx):
+        """生成磁盘缓存文件路径"""
+        return self.disk_cache_dir / f"batch_{batch_idx}.png"
+
+    def _save_image_to_disk(self, pil_img, batch_idx):
+        """将PIL图像保存到磁盘，返回文件路径"""
+        if pil_img is None:
+            return None
+        try:
+            cache_path = self._get_disk_cache_path(batch_idx)
+            pil_img.save(str(cache_path), format='PNG', compress_level=1)  # 快速压缩
+            return str(cache_path)
+        except Exception as ex:
+            self._debug_video(f"[DiskCache] save failed batch={batch_idx} error={ex}")
+            return None
+
+    def _load_image_from_disk(self, batch_idx):
+        """从磁盘加载图像"""
+        cache_path = self._get_disk_cache_path(batch_idx)
+        if not cache_path.exists():
+            return None
+        try:
+            return Image.open(cache_path)
+        except Exception as ex:
+            self._debug_video(f"[DiskCache] load failed batch={batch_idx} error={ex}")
+            return None
+
+    def _cleanup_disk_cache_out_of_window(self, window_start, window_end):
+        """清理窗口外的磁盘缓存"""
+        if not self.disk_cache_dir.exists():
+            return
+        try:
+            for cache_file in self.disk_cache_dir.glob("batch_*.png"):
+                try:
+                    idx = int(cache_file.stem.split('_')[1])
+                    if idx < window_start or idx > window_end:
+                        cache_file.unlink()
+                except Exception:
+                    pass
+        except Exception as ex:
+            self._debug_video(f"[DiskCache] cleanup failed error={ex}")
 
     def _ui(self):
         return self._owner()
@@ -718,6 +764,8 @@ class VideoManager:
         self._cleanup_out_of_range_cache(video_idx, keep_start_idx, keep_end_idx)
         self._debug_video(f"[CacheSchedule] done batch={b} window=[{window_start},{window_end}] extract_threads={extract_threads} stitch_threads={stitch_threads} keep_frame_range=[{keep_start_idx},{keep_end_idx})")
 
+        # **新增：清理窗口外的磁盘缓存**
+        self._cleanup_disk_cache_out_of_window(window_start, window_end)
         self._last_batch = b
         self._mark_batch_processed()
 
@@ -929,6 +977,9 @@ class VideoManager:
 
         for item in self.cache_dir.iterdir():
             if item.is_dir() and str(item) not in current_video_dirs:
+                # Never delete the stitch_cache directory itself
+                if item.resolve() == self.disk_cache_dir.resolve():
+                    continue
                 shutil.rmtree(str(item))
 
     def _filename_converter(self, input_value, video_idx):
@@ -1405,14 +1456,22 @@ class VideoManager:
                 flag = 0
                 self._debug_video(f"[Stitch] fallback: show first frame directly batch={global_b}")
 
+        # **关键修改：保存到磁盘而不是内存**
         if pil_img is not None and flag == 0:
-            self.shared_config.cache_img[global_b] = pil_img
+            # **关键修改：保存到磁盘**
+            disk_path = self._save_image_to_disk(pil_img, global_b)
+            if disk_path:
+                self.shared_config.cache_img[global_b] = disk_path
+            else:
+                self.shared_config.cache_img[global_b] = None
+        else:
+            self.shared_config.cache_img[global_b] = None
 
         ok = self.shared_config.cache_img[global_b] is not None
         if not ok:
-            self._set_video_status(f"Video stitch empty: batch={global_b}, flag={flag}")
+            self._set_video_status(f"Video stitch empty: video={video_idx}, batch={global_b}, flag={flag}")
         self._debug_video(
-            f"[Stitch] done (multi-video) thread={threading.current_thread().name} batch={global_b} success={ok}"
+            f"[Stitch] done thread={threading.current_thread().name} video={video_idx} batch={global_b} success={ok}"
         )
 
     def _stitch_batch(self, video_idx: int, local_b: int, global_b: int):
@@ -1466,14 +1525,21 @@ class VideoManager:
                 self._debug_video(f"[Stitch] fallback: show first frame directly video={video_idx} batch={global_b}")
 
         if pil_img is not None and flag == 0:
-            self.shared_config.cache_img[global_b] = pil_img
+            disk_path = self._save_image_to_disk(pil_img, global_b)
+            if disk_path:
+                self.shared_config.cache_img[global_b] = disk_path  # 存储路径而非对象
+            else:
+                self.shared_config.cache_img[global_b] = None
+        else:
+            self.shared_config.cache_img[global_b] = None
 
         ok = self.shared_config.cache_img[global_b] is not None
         if not ok:
             self._set_video_status(f"Video stitch empty: video={video_idx}, batch={global_b}, flag={flag}")
         self._debug_video(
-            f"[Stitch] done thread={threading.current_thread().name} video={video_idx} batch={global_b} success={ok} frames={flist}"
+            f"[Stitch] done thread={threading.current_thread().name} video={video_idx} batch={global_b} success={ok}"
         )
+
 
     def _open_first_frame(self, flist):
         if not flist:
@@ -3904,77 +3970,97 @@ class MulimgViewer (MulimgViewerGui):
         if getattr(self.shared_config, "video_mode", False):
             b = int(self.shared_config.batch_idx)
 
-            # ★ 关键改动：不再强制同步拼接，只展示已完成的缓存
-            if 0 <= b < len(self.shared_config.cache_img) and self.shared_config.cache_img[b] is not None:
-                pil_img = self.shared_config.cache_img[b]
-                self.shared_config.video_last_message = ""
+            # 从磁盘加载图像（cache_entry 现在是文件路径字符串）
+            cache_entry = self.shared_config.cache_img[b] if 0 <= b < len(self.shared_config.cache_img) else None
 
-                # 记录渲染时间（用于性能监控）
-                if getattr(self.shared_config, "is_playing", False):
+            if cache_entry is not None:
+                # cache_entry 是文件路径字符串
+                try:
+                    pil_img = Image.open(cache_entry)
+                    self.shared_config.video_last_message = ""
+
+                    # 记录渲染时间
+                    if getattr(self.shared_config, "is_playing", False):
+                        vm = getattr(self, "video_manager", None)
+                        if vm:
+                            vm.perf_monitor.push_render_event()
+
+                    self.display_bitmap(True, pil_img)
+
+                    # 更新状态栏
                     vm = getattr(self, "video_manager", None)
                     if vm:
-                        vm.perf_monitor.push_render_event()
+                        fps = vm.perf_monitor.get_fps()
+                        stitch_fps = vm.perf_monitor.get_stitch_fps()
+                        self.SetStatusText_([
+                            str(b),
+                            str(self.ImgManager.max_action_num - 1),
+                            f"FPS: {fps:.1f} | Stitch: {stitch_fps:.1f}/s",
+                            "-1"
+                        ])
+                    else:
+                        self.SetStatusText_([str(b), str(self.ImgManager.max_action_num - 1), "", "-1"])
 
-                self.display_bitmap(True, pil_img)
+                    # 更新滑块
+                    if hasattr(self, "slider_Batch") and self.slider_Batch:
+                        try:
+                            self.slider_Batch.SetValue(b)
+                        except Exception:
+                            pass
 
-                # 更新状态栏和滑块
-                try:
-                    max_batches = self.ImgManager.max_action_num
-                    if getattr(self.shared_config, "parallel_to_sequential", False):
-                        nums = [int(x) for x in getattr(self.shared_config, "video_num_list", []) if x is not None]
-                        total = sum(nums)
-                        count = max(1, int(getattr(self.shared_config, "count_per_action", 1) or 1))
-                        if total > 0:
-                            max_batches = (total + count - 1) // count
-                            self.ImgManager.max_action_num = max_batches
-                    self.slider_img.SetMax(max(0, max_batches - 1))
-                    self.slider_img.SetValue(b)
-                    self.slider_value.SetValue(str(b))
-                    self.slider_value_max.SetLabel(str(max(0, max_batches - 1)))
-                except:
-                    pass
+                    self._cancel_pending_frame_wait()
 
-                # ★ 帧已展示成功，取消任何等待中的重试
-                self._cancel_pending_frame_wait()
+                except Exception as ex:
+                    self.SetStatusText_(["-1", "-1", f"***Load cache failed: {ex}***", "-1"])
             else:
-                # ★ 当前帧未就绪：不跳帧，暂停前进，等待后重试
-                msg = str(getattr(self.shared_config, "video_last_message", "") or "").strip()
+                # 缓存未就绪
+                msg = getattr(self.shared_config, "video_last_message", "")
                 if not msg:
-                    msg = f"Buffering frame {b}..."
-                self.SetStatusText_(["-1", "-1", f"***{msg}***", "-1"])
+                    msg = f"Waiting for batch {b}..."
 
+                self.SetStatusText_([str(b), str(self.ImgManager.max_action_num - 1), msg, "-1"])
+
+                # 更新滑块
+                if hasattr(self, "slider_Batch") and self.slider_Batch:
+                    try:
+                        self.slider_Batch.SetValue(b)
+                    except Exception:
+                        pass
+
+                # 如果是播放模式，调度等待回调
                 if getattr(self.shared_config, "is_playing", False):
-                    # 暂停 timer 的前进节奏，避免在等待期间继续触发 next/last
-                    self._suspend_play_timer_for_wait()
-                    self._schedule_frame_wait_retry(b)
+                    self._schedule_frame_wait()
 
-            self.SetStatusText_(["Stitch", "-1", "-1", "-1"])
-            self.position = [0, 0]
             return
 
-        # ========== 图片模式 ==========
+        # ========== 图片模式（保持内存缓存）==========
         if self.ImgManager.max_action_num > 0:
             current_batch = max(0, min(int(getattr(self.shared_config, "batch_idx", 0)),
                                        self.ImgManager.max_action_num - 1))
 
-            self.slider_img.SetMax(self.ImgManager.max_action_num - 1)
-            self.slider_img.SetValue(current_batch)
-            self.slider_value.SetValue(str(current_batch))
-            self.slider_value_max.SetLabel(str(self.ImgManager.max_action_num - 1))
+            # 更新滑块位置
+            if hasattr(self, "slider_Batch") and self.slider_Batch:
+                try:
+                    if self.slider_Batch.GetValue() != current_batch:
+                        self.slider_Batch.SetValue(current_batch)
+                except Exception:
+                    pass
 
-            # ★ 关键改动：调用预取逻辑
+            # 更新图片缓存
             self._update_image_cache(current_batch)
 
-            # ★ 改动：优先从缓存读取
+            # 从内存缓存获取图像（保持原有逻辑）
             cache_list = self.shared_config.image_cache_img
-            if 0 <= current_batch < len(cache_list) and cache_list[current_batch] is not None:
-                # 缓存命中：直接使用
-                pil_img = cache_list[current_batch]
+            cache_entry = cache_list[current_batch] if 0 <= current_batch < len(cache_list) else None
+
+            if cache_entry is not None:
+                # 内存缓存命中，直接使用 PIL.Image 对象
+                pil_img = cache_entry
                 flag = 0
                 flist = self.shared_config.image_cache_paths[current_batch] if current_batch < len(
                     self.shared_config.image_cache_paths) else None
             else:
-                # 缓存未命中：同步拼接当前帧（这是当前帧，必须同步）
+                # 缓存未命中：同步拼接
                 with self._image_stitch_lock:
                     flist = self._get_image_flist(current_batch)
                     pil_img = None
@@ -3989,33 +4075,32 @@ class MulimgViewer (MulimgViewerGui):
                 self.img_size = pil_img.size
                 self.display_bitmap(False, pil_img)
 
-                # 更新 ImgManager 状态
-                self.ImgManager.action_count = current_batch
-                self.ImgManager.img_count = current_batch * self.ImgManager.count_per_action
+                # 更新状态栏
                 if flist:
-                    self.ImgManager.flist = flist
-                    self.current_page_img_paths = copy.deepcopy(flist)
+                    flist_display = [os.path.basename(p) for p in flist[:3]]
+                    if len(flist) > 3:
+                        flist_display.append(f"... +{len(flist) - 3}")
+                    file_info = ", ".join(flist_display)
+                else:
+                    file_info = "No files"
 
-                if self.ImgManager.type in (2, 3):
-                    try:
-                        self.SetStatusText_([
-                            "-1",
-                            f"{current_batch}/{self.ImgManager.max_action_num - 1}",
-                            f"{self.ImgManager.img_resolution[0]}x{self.ImgManager.img_resolution[1]} pixels / "
-                            f"{self.ImgManager.name_list[self.ImgManager.img_count]}"
-                            f"-{self.ImgManager.name_list[self.ImgManager.img_count + self.ImgManager.count_per_action - 1]}",
-                            "-1",
-                        ])
-                    except:
-                        pass
-                self.update_status_bar_for_current_page()
+                self.SetStatusText_([
+                    str(current_batch),
+                    str(self.ImgManager.max_action_num - 1),
+                    file_info,
+                    "-1"
+                ])
             else:
-                self.SetStatusText_(["-1", "-1", "***Error: no image in this dir!***", "-1"])
+                # 拼接失败
+                self.SetStatusText_([
+                    str(current_batch),
+                    str(self.ImgManager.max_action_num - 1),
+                    "Stitch failed",
+                    "-1"
+                ])
         else:
-            self.SetStatusText_(["-1", "-1", "***Error: no image in this dir!***", "-1"])
-
-        self.auto_layout()
-        self.SetStatusText_(["Stitch", "-1", "-1", "-1"])
+            # 无图像数据
+            self.SetStatusText_(["-1", "-1", "No images", "-1"])
 
     def _get_image_flist(self, batch_idx: int):
         count = max(1, self.ImgManager.count_per_action)
