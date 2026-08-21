@@ -4181,9 +4181,14 @@ class MulimgViewer (MulimgViewerGui):
             self.ImgManager.img_count = orig_img_count
             if orig_flist is not None:
                 self.ImgManager.flist = orig_flist
-
+    
     def _stitch_image_batch(self, t, cache_list, path_list):
         """Image-stitch task executed in the thread pool."""
+        # ★ 新增：保存原始状态（在锁外保存，避免死锁）
+        orig_action = self.ImgManager.action_count
+        orig_img_count = getattr(self.ImgManager, "img_count", 0)
+        orig_flist = getattr(self.ImgManager, "flist", None)
+
         try:
             # Protect ImgManager state access with a lock
             with self._image_stitch_lock:
@@ -4202,12 +4207,19 @@ class MulimgViewer (MulimgViewerGui):
                     cache_list[t] = None
                     path_list[t] = None
                 else:
-                    path_list[t] = flist
+                    cache_list[t] = pil_img  # ★ 修复：同时存储图像对象
+                    path_list[t] = list(flist)  # ★ 修复：使用显式传递的 flist 副本
                     self._debug_image(f"[ImageCache] async write batch={t} thread={threading.current_thread().name}")
         except Exception as e:
             self._debug_image(f"[ImageCache] async stitch failed batch={t} error={e}")
             cache_list[t] = None
             path_list[t] = None
+        finally:
+            # ★ 新增：完全恢复原始状态
+            self.ImgManager.action_count = orig_action
+            self.ImgManager.img_count = orig_img_count
+            if orig_flist is not None:
+                self.ImgManager.flist = orig_flist
 
     def _compact_row_col_for_count(self, count):
         if count <= 1:
