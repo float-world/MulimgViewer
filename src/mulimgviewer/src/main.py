@@ -133,6 +133,7 @@ class SharedConfig:
         self.cache_img = [] #Position to store stitched images
         self.image_cache_img = [] #Image mode stitch cache False
         self.image_cache_paths = [] #Image mode cache path list
+        self.image_disk_cache_dir = "Video_frames/image_stitch_cache"  # 图像模式磁盘缓存目录
         #self.debug_video = False #Video mode debug output
         self.debug_image = False #Image mode debug output
         #self.debug_thread = False #Thread debug output
@@ -150,6 +151,9 @@ class VideoManager:
         # 新增：磁盘缓存目录
         self.disk_cache_dir = Path("Video_frames") / "stitch_cache"
         self.disk_cache_dir.mkdir(parents=True, exist_ok=True)
+        # 新增：图像模式磁盘缓存目录
+        self.image_disk_cache_dir = Path("Video_frames") / "image_stitch_cache"
+        self.image_disk_cache_dir.mkdir(parents=True, exist_ok=True)
         self.perf_monitor = PerformanceMonitor()
         self.executor = None
         self.stitch_executor = None
@@ -199,6 +203,51 @@ class VideoManager:
         except Exception as ex:
             self._debug_video(f"[DiskCache] load failed batch={batch_idx} error={ex}")
             return None
+
+    # ========== 图像模式磁盘缓存方法 ==========
+    def _get_image_disk_cache_path(self, batch_idx):
+        """生成图像模式磁盘缓存文件路径"""
+        return self.image_disk_cache_dir / f"batch_{batch_idx}.png"
+
+    def _save_image_to_disk_cache(self, pil_img, batch_idx):
+        """将图像模式的PIL图像保存到磁盘，返回文件路径"""
+        if pil_img is None:
+            return None
+        try:
+            cache_path = self._get_image_disk_cache_path(batch_idx)
+            pil_img.save(str(cache_path), format='PNG', compress_level=1)
+            return str(cache_path)
+        except Exception as ex:
+            self._debug_video(f"[ImageDiskCache] save failed batch={batch_idx} error={ex}")
+            return None
+
+    def _load_image_from_disk_cache(self, batch_idx):
+        """从磁盘加载图像模式的缓存图像"""
+        cache_path = self._get_image_disk_cache_path(batch_idx)
+        if not cache_path.exists():
+            return None
+        try:
+            return Image.open(cache_path)
+        except Exception as ex:
+            self._debug_video(f"[ImageDiskCache] load failed batch={batch_idx} error={ex}")
+            return None
+
+    def _cleanup_image_disk_cache_out_of_window(self, window_start, window_end):
+        """清理图像模式窗口外的磁盘缓存"""
+        if not self.image_disk_cache_dir.exists():
+            return
+        try:
+            for cache_file in self.image_disk_cache_dir.glob("batch_*.png"):
+                try:
+                    idx = int(cache_file.stem.split('_')[1])
+                    if idx < window_start or idx > window_end:
+                        cache_file.unlink()
+                except Exception:
+                    pass
+        except Exception as ex:
+            self._debug_video(f"[ImageDiskCache] cleanup error={ex}")
+
+    # ========== 图像模式磁盘缓存方法结束 ==========
 
     def _cleanup_disk_cache_out_of_window(self, window_start, window_end):
         """清理窗口外的磁盘缓存"""
@@ -4054,9 +4103,25 @@ class MulimgViewer (MulimgViewerGui):
             cache_entry = cache_list[current_batch] if 0 <= current_batch < len(cache_list) else None
 
             if cache_entry is not None:
-                # 内存缓存命中，直接使用 PIL.Image 对象
-                pil_img = cache_entry
-                flag = 0
+                # ★ 修改：支持从磁盘路径加载图像
+                if isinstance(cache_entry, str):
+                    # 从磁盘路径加载
+                    vm = getattr(self, "video_manager", None)
+                    if vm:
+                        pil_img = vm._load_image_from_disk_cache(current_batch)
+                    else:
+                        pil_img = Image.open(cache_entry)
+                    if pil_img is None:
+                        # 磁盘加载失败，标记为未命中
+                        cache_entry = None
+                        pil_img = None
+                        flag = 1
+                    else:
+                        flag = 0
+                else:
+                    # 内存缓存命中，直接使用 PIL.Image 对象
+                    pil_img = cache_entry
+                    flag = 0
                 flist = self.shared_config.image_cache_paths[current_batch] if current_batch < len(
                     self.shared_config.image_cache_paths) else None
             else:
@@ -4154,7 +4219,15 @@ class MulimgViewer (MulimgViewerGui):
                         self.ImgManager.img_count = batch_idx * self.ImgManager.count_per_action
                         pil_img, flag = self.compose_current_frame(batch_idx=batch_idx, flist=flist)
                         if flag == 0:
-                            cache_list[batch_idx] = pil_img
+                            # ★ 修改：优先保存到磁盘，失败则保存到内存
+                            vm = getattr(self, "video_manager", None)
+                            disk_path = None
+                            if vm:
+                                disk_path = vm._save_image_to_disk_cache(pil_img, batch_idx)
+                            if disk_path:
+                                cache_list[batch_idx] = disk_path  # 存储磁盘路径
+                            else:
+                                cache_list[batch_idx] = pil_img  # 降级到内存
                             path_list[batch_idx] = flist
                             self._debug_image(f"[ImageCache] sync write batch={batch_idx}")
                         else:
@@ -4207,7 +4280,15 @@ class MulimgViewer (MulimgViewerGui):
                     cache_list[t] = None
                     path_list[t] = None
                 else:
-                    cache_list[t] = pil_img  # ★ 修复：同时存储图像对象
+                    # ★ 修改：优先保存到磁盘，失败则保存到内存
+                    vm = getattr(self, "video_manager", None)
+                    disk_path = None
+                    if vm:
+                        disk_path = vm._save_image_to_disk_cache(pil_img, t)
+                    if disk_path:
+                        cache_list[t] = disk_path  # 存储磁盘路径
+                    else:
+                        cache_list[t] = pil_img  # 降级到内存
                     path_list[t] = list(flist)  # ★ 修复：使用显式传递的 flist 副本
                     self._debug_image(f"[ImageCache] async write batch={t} thread={threading.current_thread().name}")
         except Exception as e:
