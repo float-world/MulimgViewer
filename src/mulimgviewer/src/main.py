@@ -109,6 +109,27 @@ class PerformanceMonitor:
             return None
         return min(self.buffer_history)
 
+    def get_fps(self):
+        """计算渲染 FPS（基于 render_history）"""
+        if not self.render_history:
+            # fallback: 从 stitch_history 估算
+            if self.stitch_history:
+                avg_time = sum(self.stitch_history) / len(self.stitch_history)
+                return 1.0 / avg_time if avg_time > 0 else 0.0
+            return 0.0
+        intervals = list(self.render_history)
+        if len(intervals) < 2:
+            return 0.0
+        avg_interval = sum(intervals) / len(intervals)
+        return 1.0 / avg_interval if avg_interval > 0 else 0.0
+
+    def get_stitch_fps(self):
+        """计算拼接 FPS（基于 stitch_history）"""
+        if not self.stitch_history:
+            return 0.0
+        avg_time = sum(self.stitch_history) / len(self.stitch_history)
+        return 1.0 / avg_time if avg_time > 0 else 0.0
+
 class SharedConfig:
     def __init__(self):
         '''Variables shared by MulimgViewer and VideoManager.'''
@@ -134,11 +155,11 @@ class SharedConfig:
         self.image_cache_img = [] #Image mode stitch cache False
         self.image_cache_paths = [] #Image mode cache path list
         self.image_disk_cache_dir = "Video_frames/image_stitch_cache"  # 图像模式磁盘缓存目录
-        #self.debug_video = False #Video mode debug output
+        self.debug_video = False #Video mode debug output
         self.debug_image = False #Image mode debug output
-        #self.debug_thread = False #Thread debug output
-        self.debug_thread = True
-        self.debug_video = True
+        self.debug_thread = False #Thread debug output
+        #self.debug_thread = True
+        #self.debug_video = True
         self.interval_recommend = None #Playback interval recommendation
         self.video_last_message = "" # Most recent video error/diagnostic information
 
@@ -2607,6 +2628,26 @@ class MulimgViewer (MulimgViewerGui):
             count = max(1, int(getattr(self.shared_config, "count_per_action", 1) or 1))
             if total > 0:
                 self.ImgManager.max_action_num = max(1, (total + count - 1) // count)
+        elif getattr(self.shared_config, "video_mode", False):
+            # 纯视频模式：重新计算 max_action_num
+            nums = [int(x) for x in getattr(self.shared_config, "video_num_list", []) if x is not None and int(x) > 0]
+            if nums:
+                img_num = max(nums)
+                count = max(1, int(getattr(self.shared_config, "count_per_action", 1) or 1))
+                if img_num % count:
+                    max_action_num = int(img_num / count) + 1
+                else:
+                    max_action_num = int(img_num / count)
+                self.ImgManager.max_action_num = max(1, max_action_num)
+        else:
+            # 图片模式：重新计算 max_action_num
+            count = max(1, self.ImgManager.count_per_action)
+            img_num = int(getattr(self.ImgManager, "img_num", 0) or 0)
+            if img_num > 0:
+                max_batches = (img_num + count - 1) // count
+            else:
+                max_batches = 1
+            self.ImgManager.max_action_num = max(1, max_batches)
 
         max_allowed = int((getattr(self.ImgManager, "max_action_num", 1) or 1) - 1)
         max_idx = max(0, max_allowed)
@@ -2620,6 +2661,9 @@ class MulimgViewer (MulimgViewerGui):
         # In video mode, prepare cache in the background without rendering
         if getattr(self.shared_config, "video_mode", False):
             self.video_manager.update_cache()
+
+        # 刷新显示，保留文本框的值
+        self.show_img(preserve_text_value=True)
 
     def slider_value_change(self, event, value=None):
         if self.ImgManager.img_num == 0:
@@ -2639,6 +2683,26 @@ class MulimgViewer (MulimgViewerGui):
             count = max(1, int(getattr(self.shared_config, "count_per_action", 1) or 1))
             if total > 0:
                 self.ImgManager.max_action_num = max(1, (total + count - 1) // count)
+        elif getattr(self.shared_config, "video_mode", False):
+            # 纯视频模式：重新计算 max_action_num
+            nums = [int(x) for x in getattr(self.shared_config, "video_num_list", []) if x is not None and int(x) > 0]
+            if nums:
+                img_num = max(nums)
+                count = max(1, int(getattr(self.shared_config, "count_per_action", 1) or 1))
+                if img_num % count:
+                    max_action_num = int(img_num / count) + 1
+                else:
+                    max_action_num = int(img_num / count)
+                self.ImgManager.max_action_num = max(1, max_action_num)
+        else:
+            # 图片模式：重新计算 max_action_num
+            count = max(1, self.ImgManager.count_per_action)
+            img_num = int(getattr(self.ImgManager, "img_num", 0) or 0)
+            if img_num > 0:
+                max_batches = (img_num + count - 1) // count
+            else:
+                max_batches = 1
+            self.ImgManager.max_action_num = max(1, max_batches)
 
         max_allowed = int((getattr(self.ImgManager, "max_action_num", 1) or 1) - 1)
         max_idx = max(0, max_allowed)
@@ -2648,6 +2712,9 @@ class MulimgViewer (MulimgViewerGui):
         self.ImgManager.img_count = clamped * self.ImgManager.count_per_action
         if self.shared_config.video_mode:
             self.video_manager.update_cache()
+
+        # 刷新显示，保留文本框的值
+        self.show_img(preserve_text_value=True)
 
     def save_img(self, event):
         type_ = self.choice_output.GetSelection()
@@ -2793,8 +2860,47 @@ class MulimgViewer (MulimgViewerGui):
                 self.ImgManager.action_count = self.ImgManager.max_action_num-1
                 self.shared_config.batch_idx = self.ImgManager.action_count
 
+            # 视频模式：读取文本框值并跳转到对应位置
+            try:
+                target = int(self.slider_value.GetValue().strip())
+            except (ValueError, AttributeError):
+                target = self.shared_config.batch_idx
+            
+            # 限制目标在有效范围内
+            max_allowed = max(0, self.ImgManager.max_action_num - 1)
+            clamped = min(max(0, target), max_allowed)
+            
+            # 更新状态
+            self.shared_config.batch_idx = clamped
+            self.ImgManager.action_count = clamped
+
         if self.ImgManager.img_num != 0:
-            self.show_img()
+            # 图片模式：读取文本框值并跳转到对应位置
+            if not getattr(self.shared_config, "video_mode", False):
+                try:
+                    target = int(self.slider_value.GetValue().strip())
+                except (ValueError, AttributeError):
+                    target = self.ImgManager.action_count
+                
+                # 重新计算 max_action_num（以防图片数量变化）
+                count = max(1, self.ImgManager.count_per_action)
+                img_num = int(getattr(self.ImgManager, "img_num", 0) or 0)
+                if img_num > 0:
+                    max_batches = (img_num + count - 1) // count
+                else:
+                    max_batches = 1
+                self.ImgManager.max_action_num = max(1, max_batches)
+                
+                # 限制目标在有效范围内
+                max_allowed = max(0, self.ImgManager.max_action_num - 1)
+                clamped = min(max(0, target), max_allowed)
+                
+                # 更新状态
+                self.shared_config.batch_idx = clamped
+                self.ImgManager.action_count = clamped
+                self.ImgManager.img_count = clamped * self.ImgManager.count_per_action
+            
+            self.show_img(preserve_text_value=True)
         else:
             self.SetStatusText_(["-1", "", "***Error: First, need to select the input dir***", "-1"])
         self.SetStatusText_(["Refresh", "-1", "-1", "-1"])
@@ -4012,7 +4118,7 @@ class MulimgViewer (MulimgViewerGui):
                     self.show_all_func_layout.Value,        # 39
                     self.func_layout_vertical.Value ]       # 40
 
-    def show_img(self):
+    def show_img(self, preserve_text_value=False):
         self._setup_img_panel()
 
         # ========== 视频模式 ==========
@@ -4028,32 +4134,32 @@ class MulimgViewer (MulimgViewerGui):
                     pil_img = Image.open(cache_entry)
                     self.shared_config.video_last_message = ""
 
-                    # 记录渲染时间
-                    if getattr(self.shared_config, "is_playing", False):
-                        vm = getattr(self, "video_manager", None)
-                        if vm:
-                            vm.perf_monitor.push_render_event()
-
                     self.display_bitmap(True, pil_img)
 
-                    # 更新状态栏
-                    vm = getattr(self, "video_manager", None)
-                    if vm:
-                        fps = vm.perf_monitor.get_fps()
-                        stitch_fps = vm.perf_monitor.get_stitch_fps()
-                        self.SetStatusText_([
-                            str(b),
-                            str(self.ImgManager.max_action_num - 1),
-                            f"FPS: {fps:.1f} | Stitch: {stitch_fps:.1f}/s",
-                            "-1"
-                        ])
-                    else:
-                        self.SetStatusText_([str(b), str(self.ImgManager.max_action_num - 1), "", "-1"])
+                    # 更新状态栏（保留 FPS 计算逻辑，但不显示）
+                    self.SetStatusText_([
+                        str(b),
+                        str(self.ImgManager.max_action_num - 1),
+                        "",
+                        "-1"
+                    ])
 
                     # 更新滑块
-                    if hasattr(self, "slider_Batch") and self.slider_Batch:
+                    if hasattr(self, "slider_img") and self.slider_img:
                         try:
-                            self.slider_Batch.SetValue(b)
+                            self.slider_img.SetValue(b)
+                        except Exception:
+                            pass
+
+                    # 更新页数文本框
+                    if hasattr(self, "slider_value") and self.slider_value:
+                        try:
+                            self.slider_value.SetValue(str(b))
+                        except Exception:
+                            pass
+                    if hasattr(self, "slider_value_max") and self.slider_value_max:
+                        try:
+                            self.slider_value_max.SetLabel(str(max(0, self.ImgManager.max_action_num - 1)))
                         except Exception:
                             pass
 
@@ -4070,9 +4176,21 @@ class MulimgViewer (MulimgViewerGui):
                 self.SetStatusText_([str(b), str(self.ImgManager.max_action_num - 1), msg, "-1"])
 
                 # 更新滑块
-                if hasattr(self, "slider_Batch") and self.slider_Batch:
+                if hasattr(self, "slider_img") and self.slider_img:
                     try:
-                        self.slider_Batch.SetValue(b)
+                        self.slider_img.SetValue(b)
+                    except Exception:
+                        pass
+
+                # 更新页数文本框
+                if hasattr(self, "slider_value") and self.slider_value:
+                    try:
+                        self.slider_value.SetValue(str(b))
+                    except Exception:
+                        pass
+                if hasattr(self, "slider_value_max") and self.slider_value_max:
+                    try:
+                        self.slider_value_max.SetLabel(str(max(0, self.ImgManager.max_action_num - 1)))
                     except Exception:
                         pass
 
@@ -4080,6 +4198,8 @@ class MulimgViewer (MulimgViewerGui):
                 if getattr(self.shared_config, "is_playing", False):
                     self._schedule_frame_wait()
 
+            # 清除可能残留的 "frame batch" 文本（第1列）
+            self.m_statusBar1.SetStatusText("", 1)
             return
 
         # ========== 图片模式（保持内存缓存）==========
@@ -4087,11 +4207,24 @@ class MulimgViewer (MulimgViewerGui):
             current_batch = max(0, min(int(getattr(self.shared_config, "batch_idx", 0)),
                                        self.ImgManager.max_action_num - 1))
 
-            # 更新滑块位置
-            if hasattr(self, "slider_Batch") and self.slider_Batch:
+            # 更新滑块位置、最大值和文本框
+            if hasattr(self, "slider_img") and self.slider_img:
                 try:
-                    if self.slider_Batch.GetValue() != current_batch:
-                        self.slider_Batch.SetValue(current_batch)
+                    max_val = max(0, self.ImgManager.max_action_num - 1)
+                    self.slider_img.SetMax(max_val)
+                    if self.slider_img.GetValue() != current_batch:
+                        self.slider_img.SetValue(current_batch)
+                except Exception:
+                    pass
+            # 只在不需要保留文本框值时才更新
+            if hasattr(self, "slider_value") and self.slider_value and not preserve_text_value:
+                try:
+                    self.slider_value.SetValue(str(current_batch))
+                except Exception:
+                    pass
+            if hasattr(self, "slider_value_max") and self.slider_value_max:
+                try:
+                    self.slider_value_max.SetLabel(str(max(0, self.ImgManager.max_action_num - 1)))
                 except Exception:
                     pass
 
@@ -4140,7 +4273,13 @@ class MulimgViewer (MulimgViewerGui):
                 self.img_size = pil_img.size
                 self.display_bitmap(False, pil_img)
 
-                # 更新状态栏
+                # 更新 ImgManager 状态（用于 UI 显示）
+                self.ImgManager.action_count = current_batch
+                self.ImgManager.img_count = current_batch * self.ImgManager.count_per_action
+                self.ImgManager.flist = flist
+                self.current_page_img_paths = copy.deepcopy(flist) if flist else []
+
+                # 显示详细状态信息（根据类型不同格式化）
                 if flist:
                     flist_display = [os.path.basename(p) for p in flist[:3]]
                     if len(flist) > 3:
@@ -4149,12 +4288,24 @@ class MulimgViewer (MulimgViewerGui):
                 else:
                     file_info = "No files"
 
-                self.SetStatusText_([
-                    str(current_batch),
-                    str(self.ImgManager.max_action_num - 1),
-                    file_info,
-                    "-1"
-                ])
+                if self.ImgManager.type in (2, 3):
+                    try:
+                        self.SetStatusText_([
+                            "-1",
+                            f"{current_batch}/{self.ImgManager.max_action_num-1}",
+                            f"{self.ImgManager.img_resolution[0]}x{self.ImgManager.img_resolution[1]} pixels / "
+                            f"{self.ImgManager.name_list[self.ImgManager.img_count]}"
+                            f"-{self.ImgManager.name_list[self.ImgManager.img_count + self.ImgManager.count_per_action - 1]}",
+                            "-1",
+                        ])
+                    except Exception:
+                        pass
+                else:
+                    # type 0 或 1：只设置第 3 列，让 update_status_bar_for_current_page 设置第 1 列
+                    self.SetStatusText_(["-1", "-1", file_info, "-1"])
+
+                # 调用 update_status_bar_for_current_page 显示详细信息
+                self.update_status_bar_for_current_page()
             else:
                 # 拼接失败
                 self.SetStatusText_([
