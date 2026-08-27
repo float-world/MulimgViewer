@@ -254,11 +254,24 @@ class VideoManager:
             return None
 
     def _cleanup_image_disk_cache_out_of_window(self, window_start, window_end):
-        """清理图像模式窗口外的磁盘缓存"""
+        """清理图像模式窗口外的磁盘缓存。
+
+        window_start=window_end=None 表示清空所有图片模式磁盘缓存，
+        用于布局变化时旧尺寸 PNG 全部失效的场景。
+        """
         if not self.image_disk_cache_dir.exists():
             return
         try:
-            for cache_file in self.image_disk_cache_dir.glob("batch_*.png"):
+            cache_files = list(self.image_disk_cache_dir.glob("batch_*.png"))
+            # 全部清理模式：window_start 和 window_end 都为 None
+            if window_start is None and window_end is None:
+                for cache_file in cache_files:
+                    try:
+                        cache_file.unlink()
+                    except Exception:
+                        pass
+                return
+            for cache_file in cache_files:
                 try:
                     idx = int(cache_file.stem.split('_')[1])
                     if idx < window_start or idx > window_end:
@@ -271,11 +284,23 @@ class VideoManager:
     # ========== 图像模式磁盘缓存方法结束 ==========
 
     def _cleanup_disk_cache_out_of_window(self, window_start, window_end):
-        """清理窗口外的磁盘缓存"""
+        """清理窗口外的磁盘缓存。
+
+        window_start=window_end=None 表示清空 stitch_cache 下所有 PNG，
+        用于加载新视频等场景的彻底清理。
+        """
         if not self.disk_cache_dir.exists():
             return
         try:
-            for cache_file in self.disk_cache_dir.glob("batch_*.png"):
+            cache_files = list(self.disk_cache_dir.glob("batch_*.png"))
+            if window_start is None and window_end is None:
+                for cache_file in cache_files:
+                    try:
+                        cache_file.unlink()
+                    except Exception:
+                        pass
+                return
+            for cache_file in cache_files:
                 try:
                     idx = int(cache_file.stem.split('_')[1])
                     if idx < window_start or idx > window_end:
@@ -700,6 +725,11 @@ class VideoManager:
                 self._debug_video(f"[CacheDir] cleanup failed {out_dir}: {ex}")
             output_list.append(str(out_dir))
         self.shared_config.video_path = output_list
+        # Bug fix: 加载新视频/重选视频时 stitch_cache 内的 batch_*.png 是上一个
+        # 视频的拼接结果，全部失效。image_stitch_cache 同理也要清。
+        self._cleanup_disk_cache_out_of_window(None, None)
+        if hasattr(self, "image_disk_cache_dir"):
+            self._cleanup_image_disk_cache_out_of_window(None, None)
 
     def update_thread_count(self, frame_num=-1):
         '''
@@ -799,22 +829,29 @@ class VideoManager:
                 if 0 <= global_t < len(self.shared_config.cache_img):
                     self.shared_config.cache_img[global_t] = None
 
-        # 1. 当前帧和历史帧：同步拼接
-        for t in range(window_start, local_b + 1):  # 包括当前帧
-            self._ensure_batch_extracted(video_idx, t, wait=True)
-            if t <= stitch_end:
-                global_t = (base_global + t) if parallel_to_seq else t
-                # ★ 强制同步拼接（确保当前帧可用）
-                if self.shared_config.cache_img[global_t] is None:
-                    self._stitch_batch(video_idx, t, global_t)
+        # 1. 当前帧：同步拼接（确保立即可用）；历史帧：缓存命中跳过，未命中则异步预取
+        for t in range(window_start, local_b):  # 仅处理历史帧，不包括当前帧
+            global_t = (base_global + t) if parallel_to_seq else t
+            if t > stitch_end:
+                continue
+            # 历史帧：若缓存已存在则跳过；若不存在则异步调度拼接
+            if self.shared_config.cache_img[global_t] is None:
+                # 触发提取（异步），完成后回调拼接
+                fut = self._ensure_batch_extracted(video_idx, t, wait=False)
+                if isinstance(fut, Future):
+                    fut.add_done_callback(partial(self._post_extract_stitch, video_idx, t, global_t))
+                elif self._should_schedule_stitch(global_t):
+                    self._schedule_stitch(video_idx, t, global_t)
+            # 已缓存的历史帧：跳过，不做同步拼接
 
+        # 2. 当前帧：必须同步拼接（保证点击下一帧后能立刻显示）
         global_local = (base_global + local_b) if parallel_to_seq else local_b
         self._ensure_batch_extracted(video_idx, local_b, wait=True)
         if local_b <= stitch_end:
             if force_rebuild_window or self.shared_config.cache_img[global_local] is None:
                 self._stitch_batch(video_idx, local_b, global_local)
 
-        # 2. 未来帧：异步预取
+        # 3. 未来帧：异步预取
         for t in range(local_b + 1, extract_end + 1):
             global_t = (base_global + t) if parallel_to_seq else t
             async_prefetch = (t <= stitch_end)
@@ -932,6 +969,11 @@ class VideoManager:
             keep_start_idx = start_tuple[0] if start_tuple and start_tuple[0] is not None else 0
             keep_end_idx = (end_tuple[1] + 1) if end_tuple and end_tuple[1] is not None else keep_start_idx
             self._cleanup_out_of_range_cache(vid, keep_start_idx, keep_end_idx)
+
+        # **Bug #2 修复：多视频模式同样需要清理磁盘缓存**
+        # 单视频模式在 _update_cache 末尾已清理；多视频模式之前遗漏了，导致
+        # stitch_cache/ 持续累积 PNG 文件。
+        self._cleanup_disk_cache_out_of_window(window_start, window_end)
 
         self._debug_video(
             f"[CacheSchedule](multi-video) done batch={global_batch} window=[{window_start},{window_end}] "
@@ -1681,6 +1723,11 @@ class MulimgViewer (MulimgViewerGui):
         self.video_manager = VideoManager(owner=self,shared_config=self.shared_config,ImgManager=self.ImgManager)
         self.image_stitch_executor = None  # Image-mode stitch thread pool
         self._image_stitch_lock = threading.Lock()  # Lock for image stitching state
+        # Stitch-result cache: avoid recomputing identical stitch inputs.
+        # Maps a deterministic key derived from layout/flist/show_custom_func to a PIL.Image.
+        self._stitch_result_cache = {}
+        self._stitch_result_cache_max = 64
+        self._stitch_result_cache_lock = threading.Lock()
         self.shift_pressed=False
         self.UpdateUI = UpdateUI
         self.get_type = get_type
@@ -1827,6 +1874,8 @@ class MulimgViewer (MulimgViewerGui):
             self.show_all_func.Bind(wx.EVT_CHECKBOX, self.on_show_all_func_changed)
         if hasattr(self, "show_custom_func"):
             self.show_custom_func.Bind(wx.EVT_CHECKBOX, self.on_show_custom_func_changed)
+        if hasattr(self, "customfunc_choice"):
+            self.customfunc_choice.Bind(wx.EVT_CHOICE, self.on_customfunc_choice_changed)
 
         if hasattr(self, "custom_algorithm_input"):
             self.custom_algorithm_input.Bind(wx.EVT_SET_FOCUS, self.disable_accel)
@@ -1985,6 +2034,11 @@ class MulimgViewer (MulimgViewerGui):
                     self.shared_config.batch_idx = 0
                     self.shared_config.image_cache_img = []
                     self.shared_config.image_cache_paths = []
+                    # Bug fix: 切换 parallel_sequential 会重建 ImgManager，
+                    # 旧尺寸的 batch_*.png 已成为孤儿，全部清空。
+                    vm = getattr(self, "video_manager", None)
+                    if vm and hasattr(vm, "_cleanup_image_disk_cache_out_of_window"):
+                        vm._cleanup_image_disk_cache_out_of_window(None, None)
                     self.show_img_init()
                     self.show_img()
                 except Exception:
@@ -2085,6 +2139,11 @@ class MulimgViewer (MulimgViewerGui):
                     self.shared_config.batch_idx = 0
                     self.shared_config.image_cache_img = []
                     self.shared_config.image_cache_paths = []
+                    # Bug fix: 切换 parallel_to_sequential 会重建 ImgManager，
+                    # 旧尺寸的 batch_*.png 已成为孤儿，全部清空。
+                    vm = getattr(self, "video_manager", None)
+                    if vm and hasattr(vm, "_cleanup_image_disk_cache_out_of_window"):
+                        vm._cleanup_image_disk_cache_out_of_window(None, None)
                     self.show_img_init()
                     self.show_img()
                 except Exception:
@@ -2302,6 +2361,14 @@ class MulimgViewer (MulimgViewerGui):
             selected = self.video_manager.select_video(type=1)
             if not selected:
                 return
+            # Bug fix: select_video 不再自动刷新 UI，调用方需显式刷新
+            self.show_img_init()
+            self.ImgManager.set_action_count(0)
+            self.show_img()
+            self._reset_image_view_origin()
+            self.choice_input_mode.SetSelection(1)
+            self.SetStatusText_(["Input", "-1", "-1", "-1"])
+            return
         else:
             # Initialize the image stitch pool
             self._init_image_stitch_executor()
@@ -2310,6 +2377,12 @@ class MulimgViewer (MulimgViewerGui):
                            wx.DD_DEFAULT_STYLE | wx.DD_DIR_MUST_EXIST)
             if dlg.ShowModal() == wx.ID_OK:
                 self.ImgManager.init(dlg.GetPath(), type=0, parallel_to_sequential=self.parallel_to_sequential.Value)
+                # Bug fix: 加载新目录 → 旧的 batch_*.png 内容已无意义，全部清空。
+                vm = getattr(self, "video_manager", None)
+                if vm and hasattr(vm, "_cleanup_image_disk_cache_out_of_window"):
+                    vm._cleanup_image_disk_cache_out_of_window(None, None)
+                self.shared_config.image_cache_img = []
+                self.shared_config.image_cache_paths = []
         self.show_img_init()
         self.ImgManager.set_action_count(0)
         self.show_img()
@@ -2824,13 +2897,6 @@ class MulimgViewer (MulimgViewerGui):
         if getattr(self, "_parallel_switch_dirty", False):
             self._apply_parallel_switch()
             self._parallel_switch_dirty = False
-        if (not getattr(self.shared_config, "video_mode", False)
-            and self.out_path_str == ""
-            and ((hasattr(self, "show_custom_func") and self.show_custom_func.GetValue())
-                 or (hasattr(self, "show_all_func") and self.show_all_func.GetValue()))):
-            self.out_path(None)
-            if self.out_path_str == "":
-                return
         self.show_img_init()
         if getattr(self.shared_config, "video_mode", False):
             self._last_refresh_batch = None
@@ -2944,6 +3010,13 @@ class MulimgViewer (MulimgViewerGui):
         vm = getattr(self, "video_manager", None)
         if vm is not None and hasattr(vm, "_last_batch"):
             vm._last_batch = None
+        # Stitch result cache must be invalidated whenever any input that
+        # affects the stitched output changes (layout, custom_func toggle,
+        # algorithm selection, magnifier state, etc.).
+        with getattr(self, "_stitch_result_cache_lock", threading.Lock()):
+            cache_dict = getattr(self, "_stitch_result_cache", None)
+            if isinstance(cache_dict, dict):
+                cache_dict.clear()
 
     def one_dir_mul_img(self, event):
         self.SetStatusText_(
@@ -2952,6 +3025,15 @@ class MulimgViewer (MulimgViewerGui):
             selected = self.video_manager.select_video(type=0)
             if not selected:
                 return
+            # Bug fix: select_video 不再自动刷新 UI，调用方需显式刷新
+            self.show_img_init()
+            self.ImgManager.set_action_count(0)
+            self.show_img()
+            self._reset_image_view_origin()
+            self.choice_input_mode.SetSelection(0)
+            self.SetStatusText_(
+                ["Sequential choose input dir", "-1", "-1", "-1"])
+            return
         else:
             # Initialize the image stitch pool
             self._init_image_stitch_executor()
@@ -2961,6 +3043,12 @@ class MulimgViewer (MulimgViewerGui):
 
             if dlg.ShowModal() == wx.ID_OK:
                 self.ImgManager.init(dlg.GetPath(), type=2)
+                # Bug fix: 加载新目录 → 旧的 batch_*.png 内容已无意义，全部清空。
+                vm = getattr(self, "video_manager", None)
+                if vm and hasattr(vm, "_cleanup_image_disk_cache_out_of_window"):
+                    vm._cleanup_image_disk_cache_out_of_window(None, None)
+                self.shared_config.image_cache_img = []
+                self.shared_config.image_cache_paths = []
         if self.shared_config.video_mode:
             if self.shared_config.video_path == []:
                 return
@@ -2985,6 +3073,12 @@ class MulimgViewer (MulimgViewerGui):
 
         if dlg.ShowModal() == wx.ID_OK:
             self.ImgManager.init(dlg.GetPath(), type=3)
+            # Bug fix: 加载新文件 → 旧的 batch_*.png 内容已无意义，全部清空。
+            vm = getattr(self, "video_manager", None)
+            if vm and hasattr(vm, "_cleanup_image_disk_cache_out_of_window"):
+                vm._cleanup_image_disk_cache_out_of_window(None, None)
+            self.shared_config.image_cache_img = []
+            self.shared_config.image_cache_paths = []
             self.show_img_init()
             self.ImgManager.set_action_count(0)
             self.show_img()
@@ -3934,16 +4028,9 @@ class MulimgViewer (MulimgViewerGui):
                 self.shared_config.image_cache_img = []
                 self.shared_config.image_cache_paths = []
                 self._image_layout_token = layout_token
-                # 清空图片模式磁盘缓存
-                try:
-                    if vm is not None and hasattr(vm, "image_disk_cache_dir") and vm.image_disk_cache_dir.exists():
-                        for cache_file in vm.image_disk_cache_dir.glob("batch_*.png"):
-                            try:
-                                cache_file.unlink()
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                # 清空图片模式磁盘缓存（布局变化意味着旧尺寸的 PNG 全部失效）
+                if vm is not None and hasattr(vm, "_cleanup_image_disk_cache_out_of_window"):
+                    vm._cleanup_image_disk_cache_out_of_window(None, None)
         else:
             # 视频模式：layout 参数变化时清空 cache_img 与磁盘缓存，
             # 避免旧尺寸的拼接帧被后续 show_img/update_cache 错误复用
@@ -4467,12 +4554,16 @@ class MulimgViewer (MulimgViewerGui):
                         self._stitch_image_batch, t, cache_list, path_list
                     )
 
-            # 清理窗口外的缓存
+            # 清理窗口外的内存缓存
             for idx in range(len(cache_list)):
                 if idx < window_start or idx > window_end:
                     cache_list[idx] = None
                     if idx < len(path_list):
                         path_list[idx] = None
+            # 清理窗口外的磁盘缓存 (image_stitch_cache/batch_*.png)
+            vm = getattr(self, "video_manager", None)
+            if vm and hasattr(vm, "_cleanup_image_disk_cache_out_of_window"):
+                vm._cleanup_image_disk_cache_out_of_window(window_start, window_end)
         finally:
             self.ImgManager.action_count = orig_action
             self.ImgManager.img_count = orig_img_count
@@ -4565,6 +4656,97 @@ class MulimgViewer (MulimgViewerGui):
                 height = np.mean(heights)
         return [int(width), int(height)]
 
+    def _build_stitch_cache_key(self, batch_idx, flist):
+        """Build a deterministic key for the stitch-result cache.
+
+        The key covers all inputs that influence stitch_images output:
+        - frame file list
+        - ImgManager layout_params (row/col, magnifier toggles, custom_func flag, algorithm id, ...)
+        - img_stitch_mode, title_setting, gap_color
+        - xy_magnifier
+        """
+        img_mgr = getattr(self, "ImgManager", None)
+        if img_mgr is None:
+            return None
+        try:
+            flist_tuple = self._safe_hashable(flist) if flist else None
+            layout_tuple = tuple(self._safe_hashable(getattr(img_mgr, "layout_params", [])))
+            title_setting = getattr(img_mgr, "title_setting", None)
+            title_tuple = tuple(self._safe_hashable(title_setting)) if title_setting is not None else ()
+            gap_color = getattr(img_mgr, "gap_color", None)
+            gap_color_tuple = tuple(self._safe_hashable(gap_color)) if gap_color is not None else ()
+            xy_mag = getattr(self, "xy_magnifier", None)
+            try:
+                xy_mag_key = repr(xy_mag)
+            except Exception:
+                xy_mag_key = id(xy_mag)
+            return (
+                batch_idx,
+                flist_tuple,
+                layout_tuple,
+                title_tuple,
+                gap_color_tuple,
+                int(getattr(img_mgr, "img_stitch_mode", 0)),
+                xy_mag_key,
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_hashable(value):
+        """Recursively convert lists/dicts to tuples so the result is hashable.
+
+        Unknown objects (e.g. wx.Colour) are converted via repr() / id() to
+        guarantee a hashable leaf.
+        """
+        if isinstance(value, list):
+            return tuple(MulimgViewer._safe_hashable(v) for v in value)
+        if isinstance(value, dict):
+            return tuple(sorted(
+                (str(k), MulimgViewer._safe_hashable(v))
+                for k, v in value.items()
+            ))
+        if isinstance(value, tuple):
+            return tuple(MulimgViewer._safe_hashable(v) for v in value)
+        if isinstance(value, (str, int, float, bool, bytes)) or value is None:
+            return value
+        # Anything else (wx.Colour, custom objects...) — use repr if available,
+        # fallback to id() so the value is at least hashable.
+        try:
+            r = repr(value)
+            if isinstance(r, str):
+                return ("__repr__", r)
+        except Exception:
+            pass
+        try:
+            return ("__id__", id(value))
+        except Exception:
+            return None
+
+    def _stitch_cache_get(self, key):
+        if key is None:
+            return None
+        cache_dict = getattr(self, "_stitch_result_cache", None)
+        if not isinstance(cache_dict, dict):
+            return None
+        with getattr(self, "_stitch_result_cache_lock", threading.Lock()):
+            return cache_dict.get(key)
+
+    def _stitch_cache_put(self, key, pil_img):
+        if key is None or pil_img is None:
+            return
+        cache_dict = getattr(self, "_stitch_result_cache", None)
+        if not isinstance(cache_dict, dict):
+            return
+        max_size = max(1, int(getattr(self, "_stitch_result_cache_max", 64)))
+        with getattr(self, "_stitch_result_cache_lock", threading.Lock()):
+            if len(cache_dict) >= max_size:
+                # Drop half of the cache to amortize eviction cost without LRU bookkeeping.
+                drop_count = max(1, len(cache_dict) // 2)
+                for old_key in list(cache_dict.keys())[:drop_count]:
+                    cache_dict.pop(old_key, None)
+            cache_dict[key] = pil_img
+
     def compose_current_frame(self, batch_idx=0, flist=None):
         """
         Only generate the stitched result for the current frame; do not touch UI state.
@@ -4572,9 +4754,18 @@ class MulimgViewer (MulimgViewerGui):
         - pil_img: PIL.Image or None
         - flag: 0 means success; other values follow ImgManager.stitch_images semantics
         """
+        # Fast path: identical inputs produce identical outputs; reuse the cached result.
+        cache_key = self._build_stitch_cache_key(batch_idx, flist)
+        cached_img = self._stitch_cache_get(cache_key)
+        if cached_img is not None:
+            self._post_compose_frame(batch_idx, flist, cached_img, 0, stitch_duration=0.0)
+            return cached_img, 0
+
         original_row_col = None
         original_resolution_setting = None
         full_capacity = None
+        pil_img = None
+        stitch_duration = 0.0
         try:
             if flist is not None and not getattr(self.shared_config, "video_mode", False):
                 row_col = self.ImgManager.layout_params[0]
@@ -4621,6 +4812,16 @@ class MulimgViewer (MulimgViewerGui):
                 self.ImgManager.layout_params[0] = original_row_col
                 self.ImgManager._show_all_func_expanded_row_col = None
 
+        if pil_img is not None:
+            self._stitch_cache_put(cache_key, pil_img)
+            self._post_compose_frame(batch_idx, flist, pil_img, 0, stitch_duration=stitch_duration)
+            return pil_img, 0
+        return None, flag if 'flag' in locals() else 1
+
+    def _post_compose_frame(self, batch_idx, flist, pil_img, flag, stitch_duration=0.0):
+        """Apply post-stitch side effects (cache_img / image_cache_img storage, perf metrics)."""
+        if pil_img is None:
+            return
         self.show_bmp_in_panel = pil_img
         self.img_size = pil_img.size
 
@@ -4639,12 +4840,10 @@ class MulimgViewer (MulimgViewerGui):
             if path_cache is not None:
                 path_cache[batch_idx] = list(store_list) if store_list else None
 
-        if video_mode:
+        if video_mode and stitch_duration > 0:
             vm = getattr(self, "video_manager", None)
             if vm and pil_img is not None:
                 vm.perf_monitor.record_stitch(stitch_duration)
-
-        return pil_img, 0
 
     #b3 修改3：display_bitmap —— 移除 Thaw 后多余的 Refresh，以及视频播放时跳过重复 layout
     # def display_bitmap(self, video_mode, pil_img):
@@ -5360,6 +5559,10 @@ def main(img_list, save_path, name_list=None, algorithm_name="{algorithm_name}")
     def on_show_custom_func_changed(self, event):
         if self.show_custom_func.GetValue():
             self.show_all_func.SetValue(False)
+        self._invalidate_render_cache()
+
+    def on_customfunc_choice_changed(self, event):
+        """Algorithm selection affects layout_params[37] -> stitch output changes."""
         self._invalidate_render_cache()
 
     #b3 修改1：next_img 和 last_img —— timer 播放时跳过 show_img_init    b5
