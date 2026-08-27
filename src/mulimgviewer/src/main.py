@@ -2323,7 +2323,24 @@ class MulimgViewer (MulimgViewerGui):
         self._is_closing = True
         self._save_window_state()
 
-        self.play_timer.Stop()
+        # ★ 修复：先停止所有后台任务，避免 rmtree 失败或线程残留
+        try:
+            self.play_timer.Stop()
+        except Exception:
+            pass
+        # 标记为不再播放，避免 timer 回调中再次启动任务
+        try:
+            self.shared_config.is_playing = False
+        except Exception:
+            pass
+
+        # 取消未开始的 pending frame wait，避免回调访问已销毁的窗口
+        try:
+            if hasattr(self, "_cancel_pending_frame_wait"):
+                self._cancel_pending_frame_wait()
+        except Exception:
+            pass
+
         # Release thread pools
         if hasattr(self, "video_manager"):
             if hasattr(self.video_manager, "executor") and self.video_manager.executor:
@@ -2334,34 +2351,43 @@ class MulimgViewer (MulimgViewerGui):
         # Release the image-mode stitch pool
         self._shutdown_image_stitch_executor()
 
-        self.shared_config.is_playing = False
-
-        if hasattr(self, "video_manager") and hasattr(self.video_manager, "executor"):
-            self.video_manager.executor.shutdown(wait=False, cancel_futures=True)
-
         if hasattr(self, 'show_bmp_in_panel'):
             del self.show_bmp_in_panel
         if hasattr(self, 'ImgManager'):
             if hasattr(self.ImgManager, 'clear_cache'):
                 self.ImgManager.clear_cache()
+
         import gc
         gc.collect()
+
+        # ★ 修复：用 try/except 包装 rmtree，避免目录被线程持有时抛出未捕获异常
         cache_base = "Video_frames"
-        if os.path.isdir(cache_base):
-            shutil.rmtree(cache_base)
+        try:
+            if os.path.isdir(cache_base):
+                shutil.rmtree(cache_base, ignore_errors=False)
+        except Exception:
+            # 如果删除失败（线程持有文件句柄等），降级为 ignore_errors
+            try:
+                shutil.rmtree(cache_base, ignore_errors=True)
+            except Exception:
+                pass
 
         if hasattr(self, "indextablegui") and self.indextablegui:
             self.indextablegui.Destroy()
         if hasattr(self, "aboutgui") and self.aboutgui:
             self.aboutgui.Destroy()
 
-        if self.get_type() == -1:
+        # ★ 修复：Destroy 自身
+        try:
             self.Destroy()
-        else:
-            try:
-                self.UpdateUI(-1)
-            finally:
-                self.Destroy()
+        except Exception:
+            pass
+
+        # ★ 修复：通知主循环退出，确保程序完全终止
+        try:
+            wx.Exit()
+        except Exception:
+            pass
 
     def _save_window_state(self):
         try:
@@ -3898,13 +3924,56 @@ class MulimgViewer (MulimgViewerGui):
 
     def show_img_init(self):
         layout_params = self.set_img_layout()
+        # ★ 修复：图片模式 + 视频模式 都要在 layout 变化时清空缓存与磁盘缓存文件
+        vm = getattr(self, "video_manager", None)
+        layout_token = repr(layout_params)
         if not getattr(self.shared_config, "video_mode", False):
-            layout_token = repr(layout_params)
             if layout_token != getattr(self, "_image_layout_token", None):
                 self._debug_image(f"[ImageCache] reset, previous_batches={len(self.shared_config.image_cache_img)}")
+                # 清空内存缓存
                 self.shared_config.image_cache_img = []
                 self.shared_config.image_cache_paths = []
                 self._image_layout_token = layout_token
+                # 清空图片模式磁盘缓存
+                try:
+                    if vm is not None and hasattr(vm, "image_disk_cache_dir") and vm.image_disk_cache_dir.exists():
+                        for cache_file in vm.image_disk_cache_dir.glob("batch_*.png"):
+                            try:
+                                cache_file.unlink()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        else:
+            # 视频模式：layout 参数变化时清空 cache_img 与磁盘缓存，
+            # 避免旧尺寸的拼接帧被后续 show_img/update_cache 错误复用
+            if layout_token != getattr(self, "_video_layout_token", None):
+                try:
+                    if not hasattr(self.shared_config, "cache_img") or self.shared_config.cache_img is None:
+                        self.shared_config.cache_img = []
+                    else:
+                        for i in range(len(self.shared_config.cache_img)):
+                            self.shared_config.cache_img[i] = None
+                except Exception:
+                    pass
+                # 清空视频模式磁盘缓存 (stitch_cache/batch_*.png)
+                try:
+                    if vm is not None and hasattr(vm, "disk_cache_dir") and vm.disk_cache_dir.exists():
+                        for cache_file in vm.disk_cache_dir.glob("batch_*.png"):
+                            try:
+                                cache_file.unlink()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                # 强制 video_manager 在下次 update_cache 中重建窗口
+                self._video_layout_token = layout_token
+                try:
+                    self._last_refresh_batch = None
+                    if vm is not None and hasattr(vm, "_last_batch"):
+                        vm._last_batch = None
+                except Exception:
+                    pass
 
         count_per_action = getattr(self.shared_config, "count_per_action", 1)
         if self.shared_config.video_mode:
@@ -4147,6 +4216,8 @@ class MulimgViewer (MulimgViewerGui):
                     # 更新滑块
                     if hasattr(self, "slider_img") and self.slider_img:
                         try:
+                            max_val = max(0, self.ImgManager.max_action_num - 1)
+                            self.slider_img.SetMax(max_val)
                             self.slider_img.SetValue(b)
                         except Exception:
                             pass
@@ -4178,6 +4249,8 @@ class MulimgViewer (MulimgViewerGui):
                 # 更新滑块
                 if hasattr(self, "slider_img") and self.slider_img:
                     try:
+                        max_val = max(0, self.ImgManager.max_action_num - 1)
+                        self.slider_img.SetMax(max_val)
                         self.slider_img.SetValue(b)
                     except Exception:
                         pass
