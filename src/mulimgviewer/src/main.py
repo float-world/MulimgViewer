@@ -214,17 +214,6 @@ class VideoManager:
             self._debug_video(f"[DiskCache] save failed batch={batch_idx} error={ex}")
             return None
 
-    def _load_image_from_disk(self, batch_idx):
-        """从磁盘加载图像"""
-        cache_path = self._get_disk_cache_path(batch_idx)
-        if not cache_path.exists():
-            return None
-        try:
-            return Image.open(cache_path)
-        except Exception as ex:
-            self._debug_video(f"[DiskCache] load failed batch={batch_idx} error={ex}")
-            return None
-
     # ========== 图像模式磁盘缓存方法 ==========
     def _get_image_disk_cache_path(self, batch_idx):
         """生成图像模式磁盘缓存文件路径"""
@@ -252,21 +241,6 @@ class VideoManager:
         except Exception as ex:
             self._debug_video(f"[ImageDiskCache] load failed batch={batch_idx} error={ex}")
             return None
-
-    def _cleanup_image_disk_cache_out_of_window(self, window_start, window_end):
-        """清理图像模式窗口外的磁盘缓存"""
-        if not self.image_disk_cache_dir.exists():
-            return
-        try:
-            for cache_file in self.image_disk_cache_dir.glob("batch_*.png"):
-                try:
-                    idx = int(cache_file.stem.split('_')[1])
-                    if idx < window_start or idx > window_end:
-                        cache_file.unlink()
-                except Exception:
-                    pass
-        except Exception as ex:
-            self._debug_video(f"[ImageDiskCache] cleanup error={ex}")
 
     # ========== 图像模式磁盘缓存方法结束 ==========
 
@@ -834,8 +808,9 @@ class VideoManager:
         self._cleanup_out_of_range_cache(video_idx, keep_start_idx, keep_end_idx)
         self._debug_video(f"[CacheSchedule] done batch={b} window=[{window_start},{window_end}] extract_threads={extract_threads} stitch_threads={stitch_threads} keep_frame_range=[{keep_start_idx},{keep_end_idx})")
 
-        # **新增：清理窗口外的磁盘缓存**
-        self._cleanup_disk_cache_out_of_window(window_start, window_end)
+        # **清理窗口外的磁盘缓存**
+        # 用户期望窗口: [local_b - R, local_b + R] (2R+1 张, 含历史帧)
+        self._cleanup_disk_cache_out_of_window(int(window_start), int(window_end))
         self._last_batch = b
         self._mark_batch_processed()
 
@@ -937,6 +912,10 @@ class VideoManager:
             f"[CacheSchedule](multi-video) done batch={global_batch} window=[{window_start},{window_end}] "
             f"extract_threads={extract_threads} stitch_threads={stitch_threads}"
         )
+
+        # **清理窗口外的磁盘缓存 (多视频路径补漏)**
+        # 窗口: [global_b - R, global_b + R],与单视频路径保持一致。
+        self._cleanup_disk_cache_out_of_window(int(window_start), int(window_end))
 
     def _ensure_batch_extracted(self, video_idx: int, local_b: int, wait: bool = True):
         n = self.shared_config.video_num_list[video_idx]
