@@ -2828,6 +2828,26 @@ class MulimgViewer (MulimgViewerGui):
                 self._rebuild_threads(new_thr)
                 self._last_thread = new_thr
 
+            # ★ 修复：skip_frames 改变后，重新计算 video_num_list
+            vm = getattr(self, 'video_manager', None)
+            if vm is not None:
+                self.shared_config.video_num_list = []
+                self.shared_config.video_fps_list = []
+                for vp in getattr(self.shared_config, "real_video_path", []):
+                    try:
+                        vm.calc_max_extractable_frames_single(vp)
+                    except Exception:
+                        self.shared_config.video_num_list.append(0)
+                        self.shared_config.video_fps_list.append(0)
+                # ★ 同步更新 ImgManager 内部状态，避免 set_count_per_action 等使用陈旧值
+                self.ImgManager.video_num_list = list(self.shared_config.video_num_list)
+                self.ImgManager.video_fps_list = list(self.shared_config.video_fps_list)
+                self.ImgManager.img_num_list = list(self.shared_config.video_num_list)
+                if self.shared_config.parallel_to_sequential:
+                    self.ImgManager.img_num = sum(int(x) for x in self.shared_config.video_num_list if x)
+                else:
+                    self.ImgManager.img_num = max(int(x) for x in self.shared_config.video_num_list if int(x) > 0) if any(int(x) > 0 for x in self.shared_config.video_num_list) else 0
+
             nums = [int(x) for x in getattr(self.shared_config, "video_num_list", []) if x is not None and int(x) > 0]
             if not nums:
                 self.ImgManager.max_action_num = 1
