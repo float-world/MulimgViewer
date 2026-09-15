@@ -2764,11 +2764,16 @@ class MulimgViewer (MulimgViewerGui):
             except:
                 pass
             self.ImgManager.layout_params[33] = self.out_path_str
+            # ★ 修复：保存当前页的 flist，因为 save_img 内部会修改 flist
+            orig_flist = getattr(self.ImgManager, 'flist', None)
             if self.show_custom_func.Value:
                 self.ImgManager.layout_params[32] = True  # customfunc
                 self.ImgManager.save_img(self.out_path_str, type_)
                 self.ImgManager.layout_params[32] = False  # customfunc
             flag = self.ImgManager.save_img(self.out_path_str, type_)
+            # ★ 恢复原始 flist，使 save_stitch_img_and_customfunc_img 使用正确的文件名
+            if orig_flist is not None:
+                self.ImgManager.flist = orig_flist
 
             self.ImgManager.save_stitch_img_and_customfunc_img(
                 self.out_path_str,
