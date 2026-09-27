@@ -4585,7 +4585,11 @@ class MulimgViewer (MulimgViewerGui):
                 row_col_one_img = self.ImgManager.layout_params[1]
                 one_img_capacity = max(1, row_col_one_img[0] * row_col_one_img[1])
                 full_capacity = max(1, row_col[0] * row_col[1] * one_img_capacity)
-                if 0 < len(flist) < full_capacity:
+                # 【修复】禁用自动压缩：原本当 len(flist) < full_capacity 时会强制用最小包围盒
+                # 改写 RowCol（例如 3 张图 + RowCol=2,2 → 被改成 [1,3]），
+                # 导致用户在 parallel manual / 末尾 batch 等场景无法使用自己设置的布局。
+                # 这里直接关闭该压缩逻辑，UI 上设的 RowCol 永远生效。
+                if False and 0 < len(flist) < full_capacity:
                     original_row_col = row_col.copy()
                     compact_count = int(math.ceil(len(flist) / one_img_capacity))
                     self.ImgManager.layout_params[0] = self._compact_row_col_for_count(compact_count)
