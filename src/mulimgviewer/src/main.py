@@ -1879,6 +1879,7 @@ class MulimgViewer (MulimgViewerGui):
                 self.video_manager.update_thread_count()
 
     def on_enable_video_mode(self, event):
+        prev_video_mode = self.shared_config.video_mode
         self.shared_config.video_mode = self.m_checkBox33.GetValue()
         on_video_mode_change(self.shared_config.video_mode)
 
@@ -1889,6 +1890,11 @@ class MulimgViewer (MulimgViewerGui):
         else:
             # Entering image mode: initialize image stitch pool
             self._init_image_stitch_executor()
+            # ★ 从视频模式切到图片模式时，主动清理视频模式的本地缓存，
+            #   防止陈旧的视频帧 / 路径被图片模式的渲染路径误用，
+            #   也能避免误把 video_mode 再切回 True 时显示旧的视频帧。
+            if prev_video_mode:
+                self._clear_video_mode_cache()
 
     # def on_interval_changed(self, event):
     #     self.shared_config.interval = float(self.m_textCtrl28.GetValue() or 1.0)
@@ -2948,6 +2954,112 @@ class MulimgViewer (MulimgViewerGui):
         vm = getattr(self, "video_manager", None)
         if vm is not None and hasattr(vm, "_last_batch"):
             vm._last_batch = None
+
+    def _clear_video_mode_cache(self):
+        """Clear every piece of local state owned by video mode.
+
+        Called when leaving video mode for image mode so that stale video
+        stitches (in-memory PNG paths and on-disk Video_frames/stitch_cache
+        files) cannot leak into the image-mode render path or get re-displayed
+        if the user toggles video mode back on without a fresh selection.
+        """
+        vm = getattr(self, "video_manager", None)
+
+        # 1. Clear in-memory stitch cache (list of PNG paths from video mode)
+        self.shared_config.cache_img = []
+
+        # 2. Reset video_manager prefetch & metadata state to avoid leaking
+        #    pending futures or stale _last_batch markers into the next run.
+        if vm is not None:
+            if hasattr(vm, "_last_batch"):
+                vm._last_batch = None
+            if hasattr(vm, "_meta_cache") and isinstance(vm._meta_cache, dict):
+                vm._meta_cache.clear()
+            try:
+                pending_lock = getattr(vm, "_pending_lock", None)
+                if pending_lock is not None:
+                    with pending_lock:
+                        for fut in list(getattr(vm, "_pending_extract", {}).values()):
+                            try:
+                                fut.cancel()
+                            except Exception:
+                                pass
+                        if hasattr(vm, "_pending_extract"):
+                            vm._pending_extract.clear()
+                        if hasattr(vm, "_pending_stitch_async"):
+                            vm._pending_stitch_async = 0
+            except Exception:
+                pass
+            if hasattr(vm, "perf_monitor"):
+                try:
+                    vm.perf_monitor.reset_render_clock()
+                except Exception:
+                    pass
+
+        # 3. Drop video mode path/metadata bookkeeping so a later accidental
+        #    re-entry into video mode can't accidentally reuse stale data.
+        self.shared_config.real_video_path = []
+        self.shared_config.video_path = []
+        self.shared_config.video_num_list = []
+        self.shared_config.video_fps_list = []
+        self.shared_config.batch_idx = 0
+        self.shared_config.video_last_message = ""
+        self.shared_config.interval_recommend = None
+        self.shared_config.current_video_index = 0
+        self.last_direction = 0
+
+        # 4. Reset layout-rebuild token so layout-driven cache invalidation
+        #    still fires on the first image-mode refresh after the switch.
+        self._last_refresh_batch = None
+        self._last_thread = None
+        # Also clear the deferred "parallel switch" marker – it is only meant
+        # to apply while still inside video mode and would otherwise linger
+        # in the image-mode path on the next refresh().
+        self._parallel_switch_dirty = False
+
+        # 5. Clear on-disk video stitch cache (Video_frames/stitch_cache).
+        try:
+            if vm is not None and hasattr(vm, "disk_cache_dir"):
+                cache_root = Path(str(vm.disk_cache_dir))
+                if cache_root.exists():
+                    for cache_file in cache_root.glob("batch_*.png"):
+                        try:
+                            cache_file.unlink()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # 6. Also wipe the per-video JPEG working directories, since they
+        #    are no longer referenced after mode switch.
+        try:
+            cache_base = Path("Video_frames")
+            if cache_base.exists():
+                stitch_cache = (
+                    Path(str(getattr(vm, "disk_cache_dir", cache_base / "stitch_cache")))
+                    if vm is not None
+                    else cache_base / "stitch_cache"
+                )
+                image_cache = cache_base / "image_stitch_cache"
+                for entry in cache_base.iterdir():
+                    if not entry.is_dir():
+                        continue
+                    try:
+                        if stitch_cache.exists() and entry.resolve() == stitch_cache.resolve():
+                            continue
+                        if image_cache.exists() and entry.resolve() == image_cache.resolve():
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        shutil.rmtree(str(entry), ignore_errors=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        if getattr(self.shared_config, "debug_video", False):
+            print("[VideoMode] cleared local cache on video->image transition")
 
     def one_dir_mul_img(self, event):
         self.SetStatusText_(
