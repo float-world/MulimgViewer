@@ -2328,10 +2328,13 @@ class MulimgViewer (MulimgViewerGui):
 
         # Release thread pools
         if hasattr(self, "video_manager"):
+            shutdown_kwargs = {"wait": False}
+            if sys.version_info >= (3, 9):
+                shutdown_kwargs["cancel_futures"] = True
             if hasattr(self.video_manager, "executor") and self.video_manager.executor:
-                self.video_manager.executor.shutdown(wait=False, cancel_futures=True)
+                self.video_manager.executor.shutdown(**shutdown_kwargs)
             if hasattr(self.video_manager, "stitch_executor") and self.video_manager.stitch_executor:
-                self.video_manager.stitch_executor.shutdown(wait=False, cancel_futures=True)
+                self.video_manager.stitch_executor.shutdown(**shutdown_kwargs)
 
         # Release the image-mode stitch pool
         self._shutdown_image_stitch_executor()
@@ -4044,22 +4047,25 @@ class MulimgViewer (MulimgViewerGui):
         vm = getattr(self, "video_manager", None)
         layout_token = repr(layout_params)
         if not getattr(self.shared_config, "video_mode", False):
-            if layout_token != getattr(self, "_image_layout_token", None):
-                self._debug_image(f"[ImageCache] reset, previous_batches={len(self.shared_config.image_cache_img)}")
-                # 清空内存缓存
-                self.shared_config.image_cache_img = []
-                self.shared_config.image_cache_paths = []
-                self._image_layout_token = layout_token
-                # 清空图片模式磁盘缓存
-                try:
-                    if vm is not None and hasattr(vm, "image_disk_cache_dir") and vm.image_disk_cache_dir.exists():
-                        for cache_file in vm.image_disk_cache_dir.glob("batch_*.png"):
-                            try:
-                                cache_file.unlink()
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+            image_token = (layout_token, getattr(self.ImgManager, "type", None),
+                           repr(getattr(self.ImgManager, "input_path", None)))
+            if image_token != getattr(self, "_image_layout_token", None):
+                with self._image_stitch_lock:
+                    self._debug_image(f"[ImageCache] reset, previous_batches={len(self.shared_config.image_cache_img)}")
+                    # 清空内存缓存
+                    self.shared_config.image_cache_img = []
+                    self.shared_config.image_cache_paths = []
+                    self._image_layout_token = image_token
+                    # 清空图片模式磁盘缓存
+                    try:
+                        if vm is not None and hasattr(vm, "image_disk_cache_dir") and vm.image_disk_cache_dir.exists():
+                            for cache_file in vm.image_disk_cache_dir.glob("batch_*.png"):
+                                try:
+                                    cache_file.unlink()
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
         else:
             # 视频模式：layout 参数变化时清空 cache_img 与磁盘缓存，
             # 避免旧尺寸的拼接帧被后续 show_img/update_cache 错误复用
@@ -4462,10 +4468,12 @@ class MulimgViewer (MulimgViewerGui):
                 self.img_size = pil_img.size
                 self.display_bitmap(False, pil_img)
 
-                # 更新 ImgManager 状态（用于 UI 显示）
-                self.ImgManager.action_count = current_batch
-                self.ImgManager.img_count = current_batch * self.ImgManager.count_per_action
-                self.ImgManager.flist = flist
+                # 更新 ImgManager 状态（用于 UI 显示）。与后台拼接共用同一把锁，
+                # 避免预取下一页时将当前页 flist 写回，造成图片与标题错位。
+                with self._image_stitch_lock:
+                    self.ImgManager.action_count = current_batch
+                    self.ImgManager.img_count = current_batch * self.ImgManager.count_per_action
+                    self.ImgManager.flist = flist
                 self.current_page_img_paths = copy.deepcopy(flist) if flist else []
 
                 # 显示详细状态信息（根据类型不同格式化）
@@ -4542,9 +4550,10 @@ class MulimgViewer (MulimgViewerGui):
         if len(path_list) <= window_end:
             path_list.extend([None] * (window_end + 1 - len(path_list)))
 
-        orig_action = self.ImgManager.action_count
-        orig_img_count = getattr(self.ImgManager, "img_count", 0)
-        orig_flist = getattr(self.ImgManager, "flist", None)
+        with self._image_stitch_lock:
+            orig_action = self.ImgManager.action_count
+            orig_img_count = getattr(self.ImgManager, "img_count", 0)
+            orig_flist = getattr(self.ImgManager, "flist", None)
 
         if self.image_stitch_executor is None:
             self._init_image_stitch_executor()
@@ -4574,15 +4583,6 @@ class MulimgViewer (MulimgViewerGui):
                             cache_list[batch_idx] = None
                             path_list[batch_idx] = None
 
-            # 其他帧异步预取
-            for t in range(window_start, window_end + 1):
-                if t == batch_idx:
-                    continue
-                if cache_list[t] is None:
-                    self.image_stitch_executor.submit(
-                        self._stitch_image_batch, t, cache_list, path_list
-                    )
-
             # 清理窗口外的缓存
             for idx in range(len(cache_list)):
                 if idx < window_start or idx > window_end:
@@ -4590,21 +4590,31 @@ class MulimgViewer (MulimgViewerGui):
                     if idx < len(path_list):
                         path_list[idx] = None
         finally:
-            self.ImgManager.action_count = orig_action
-            self.ImgManager.img_count = orig_img_count
-            if orig_flist is not None:
-                self.ImgManager.flist = orig_flist
+            with self._image_stitch_lock:
+                self.ImgManager.action_count = orig_action
+                self.ImgManager.img_count = orig_img_count
+                if orig_flist is not None:
+                    self.ImgManager.flist = orig_flist
+
+        # 其他帧异步预取：先恢复共享的 ImgManager 状态，再启动线程
+        for t in range(window_start, window_end + 1):
+            if t == batch_idx:
+                continue
+            if cache_list[t] is None:
+                self.image_stitch_executor.submit(
+                    self._stitch_image_batch, t, cache_list, path_list
+                )
     
     def _stitch_image_batch(self, t, cache_list, path_list):
         """Image-stitch task executed in the thread pool."""
-        # ★ 新增：保存原始状态（在锁外保存，避免死锁）
-        orig_action = self.ImgManager.action_count
-        orig_img_count = getattr(self.ImgManager, "img_count", 0)
-        orig_flist = getattr(self.ImgManager, "flist", None)
-
-        try:
-            # Protect ImgManager state access with a lock
-            with self._image_stitch_lock:
+        # Protect the state snapshot, stitching and restoration with the same lock.
+        with self._image_stitch_lock:
+            if cache_list is not self.shared_config.image_cache_img:
+                return
+            orig_action = self.ImgManager.action_count
+            orig_img_count = getattr(self.ImgManager, "img_count", 0)
+            orig_flist = getattr(self.ImgManager, "flist", None)
+            try:
                 flist = self._get_image_flist(t)
                 if not flist:
                     cache_list[t] = None
@@ -4631,16 +4641,15 @@ class MulimgViewer (MulimgViewerGui):
                         cache_list[t] = pil_img  # 降级到内存
                     path_list[t] = list(flist)  # ★ 修复：使用显式传递的 flist 副本
                     self._debug_image(f"[ImageCache] async write batch={t} thread={threading.current_thread().name}")
-        except Exception as e:
-            self._debug_image(f"[ImageCache] async stitch failed batch={t} error={e}")
-            cache_list[t] = None
-            path_list[t] = None
-        finally:
-            # ★ 新增：完全恢复原始状态
-            self.ImgManager.action_count = orig_action
-            self.ImgManager.img_count = orig_img_count
-            if orig_flist is not None:
-                self.ImgManager.flist = orig_flist
+            except Exception as e:
+                self._debug_image(f"[ImageCache] async stitch failed batch={t} error={e}")
+                cache_list[t] = None
+                path_list[t] = None
+            finally:
+                self.ImgManager.action_count = orig_action
+                self.ImgManager.img_count = orig_img_count
+                if orig_flist is not None:
+                    self.ImgManager.flist = orig_flist
 
     def _compact_row_col_for_count(self, count):
         if count <= 1:
