@@ -687,6 +687,30 @@ class VideoManager:
         self.shared_config.video_fps_list.append(fps)
         self.shared_config.video_num_list.append(viewable)
 
+    def _probe_json(self, args, what="ffprobe"):
+        '''Run ffprobe and parse its JSON output.
+
+        ffprobe writes UTF-8. On a Chinese-locale Windows the default text codec
+        is cp936(GBK), so letting subprocess decode it raises UnicodeDecodeError
+        inside its reader thread, which leaves stdout as None and used to
+        surface as a bogus "no video stream found".
+        '''
+        cp = subprocess.run(
+            ["ffprobe", "-v", "error"] + [str(a) for a in args],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if cp.returncode != 0:
+            raise RuntimeError(
+                f"{what} failed (code={cp.returncode}): {(cp.stderr or '').strip()}"
+            )
+        try:
+            return json.loads(cp.stdout or "{}")
+        except Exception as ex:
+            raise RuntimeError(f"{what} json parse failed: {ex}")
+
     def _get_meta(self, video_path):
         '''How to get the FPS and total frame count of a video using FFmpeg'''
         if video_path in self._meta_cache:
@@ -701,25 +725,15 @@ class VideoManager:
                 self._debug_video(f"[Metadata] ffmpeg.probe failed: {ex}")
 
         if not p:
-            cp = subprocess.run(
+            p = self._probe_json(
                 [
-                    "ffprobe",
-                    "-v", "error",
                     "-print_format", "json",
                     "-show_streams",
                     "-show_format",
                     str(video_path),
                 ],
-                capture_output=True,
-                text=True,
-                check=False,
+                what="ffprobe",
             )
-            if cp.returncode != 0:
-                raise RuntimeError(f"ffprobe failed (code={cp.returncode}): {cp.stderr.strip()}")
-            try:
-                p = json.loads(cp.stdout or "{}")
-            except Exception as ex:
-                raise RuntimeError(f"ffprobe json parse failed: {ex}")
 
         streams = p.get("streams", []) if isinstance(p, dict) else []
         vs = next((s for s in streams if s.get('codec_type') == 'video'), None)
@@ -761,7 +775,8 @@ class VideoManager:
                         str(video_path),
                     ],
                     capture_output=True,
-                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     check=False,
                 )
                 probe_txt = (cp.stdout or "").strip().splitlines()
@@ -1263,7 +1278,7 @@ class VideoManager:
                             "-y", dst,
                         ]
                         try:
-                            cp = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                            cp = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", check=False)
                             if cp.returncode != 0:
                                 last_error = (cp.stderr or cp.stdout or "").strip() or f"ffmpeg exit code {cp.returncode}"
                         except Exception as ex:
@@ -1980,6 +1995,14 @@ class MulimgViewer (MulimgViewerGui):
                 field.Bind(wx.EVT_SET_FOCUS, self.disable_accel)
                 field.Bind(wx.EVT_KILL_FOCUS, self.enable_accel)
                 field.Bind(wx.EVT_KILL_FOCUS, handler)
+                # ★ 回车直接提交: 单行 TextCtrl 默认不处理回车, 必须显式加上
+                #   TE_PROCESS_ENTER, 否则 EVT_TEXT_ENTER 永远不触发。
+                #   有了它, 输入框里按回车就等于"改好了", 不用再点别处失焦。
+                try:
+                    field.SetStyle(field.GetStyle() | wx.TE_PROCESS_ENTER)
+                    field.Bind(wx.EVT_TEXT_ENTER, self.on_video_field_enter)
+                except Exception:
+                    pass
 
     def _handle_custom_algorithm_key(self, event):
         if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
@@ -2003,23 +2026,126 @@ class MulimgViewer (MulimgViewerGui):
         else:
             vm.stitch_executor = ThreadPoolExecutor(max_workers=desired_stitch)
 
+    # ========== 视频设置数值框的提交 ==========
+    # ★ 这些框以前只靠 EVT_KILL_FOCUS 才写回 shared_config, 而 refresh() 是直接读
+    #   shared_config 的。于是"改了生不生效"完全取决于一个看不见的事件:
+    #     - 从菜单/快捷键刷新时输入框不会失焦, 改动被静默丢弃;
+    #     - 输入非法内容时 int() 会在事件处理里抛异常, 值悄悄保持旧的, 而输入框
+    #       一直显示着你打的字 —— 看上去就是"改了没反应";
+    #     - 生效了也没有任何回显, 光标 "|" 一直留在框里, 分不清到底提交没有。
+    #   现在统一走 _commit_video_settings(): 读框 -> 校验 -> 归一化 -> 写回框里,
+    #   保证输入框显示的永远是当前真正生效的值, refresh() 开头也会主动提交一次。
+    def _commit_video_settings(self):
+        """把视频设置里的数值输入框提交到 shared_config, 并把框里的文本归一化。"""
+
+        def _read_number(field, default, minimum, integer=True):
+            try:
+                raw = str(field.GetValue()).strip()
+            except Exception:
+                raw = ""
+            value = default
+            if raw:
+                try:
+                    value = int(float(raw)) if integer else float(raw)
+                except (TypeError, ValueError):
+                    value = default
+            try:
+                value = max(minimum, value)
+            except (TypeError, ValueError):
+                value = default
+            return value
+
+        # ---- 播放间隔 ----
+        interval = _read_number(self.m_textCtrl28, 1.0, 0.05, integer=False)
+        if abs(float(self.shared_config.interval) - interval) > 1e-9:
+            self.shared_config.interval = interval
+            # 播放中改间隔, 立即重启 timer 让新值生效
+            if getattr(self.shared_config, "is_playing", False):
+                try:
+                    self.play_timer.Stop()
+                    self.play_timer.Start(int(interval * 1000), oneShot=False)
+                except Exception:
+                    pass
+
+        # ---- 线程数 ----
+        threads = _read_number(self.m_textCtrl29, 4, 1)
+        if threads != self.shared_config.thread:
+            self.shared_config.thread = threads
+            # 立即刷新线程池分配
+            if hasattr(self, "video_manager"):
+                try:
+                    self.video_manager.update_thread_count()
+                except Exception:
+                    pass
+
+        # ---- Cached Frames (缓存帧数) ----
+        self.shared_config.cache_num = _read_number(self.m_textCtrl30, 2, 1)
+
+        # ---- Skip Frame (跳过帧数) ----
+        skip = _read_number(self.m_textCtrl281, 0, 0)
+        self.shared_config.skip_frames = skip
+        self.ImgManager.skip = skip
+
+        # 归一化: 输入框里显示的必须是当前真正生效的值
+        for field, value in ((self.m_textCtrl28, self.shared_config.interval),
+                              (self.m_textCtrl29, self.shared_config.thread),
+                              (self.m_textCtrl30, self.shared_config.cache_num),
+                              (self.m_textCtrl281, self.shared_config.skip_frames)):
+            try:
+                text = str(value)
+                if str(field.GetValue()).strip() != text:
+                    field.SetValue(text)
+            except Exception:
+                pass
+
+    def _blur_settings_field(self):
+        """刷新/回车提交后, 如果光标还停在设置区的输入框里, 把焦点挪走。
+
+        否则输入框一直闪着 "|" 光标, 看着就像刚才那次修改没提交上去。
+        """
+        try:
+            focus = wx.Window.FindFocus()
+        except Exception:
+            return
+        if focus is None:
+            return
+        settings = getattr(self, "scrolledWindow_set", None)
+        node = focus
+        while node is not None:
+            if node is settings:
+                break
+            node = node.GetParent()
+        else:
+            return
+        target = getattr(self, "refresh_button", None)
+        if target is None:
+            return
+        try:
+            target.SetFocus()
+        except Exception:
+            pass
+
+    def on_video_field_enter(self, event):
+        """在视频设置的数值框里按回车: 立刻提交, 并把光标收掉。"""
+        self._commit_video_settings()
+        self._blur_settings_field()
+        if event is not None:
+            event.Skip()
+
     def on_cache_num_change(self, event):
-        self.shared_config.cache_num = int(self.m_textCtrl30.GetValue() or 2)
+        self._commit_video_settings()
+        if event is not None:
+            event.Skip()
 
     def on_skip_changed(self, event):
-        self.shared_config.skip_frames = max(0, int(self.m_textCtrl281.GetValue() or 0))
-        self.ImgManager.skip = max(0, int(self.m_textCtrl281.GetValue() or 0))
+        self._commit_video_settings()
+        if event is not None:
+            event.Skip()
 
     def on_thread_change(self, event):
-        new_thread_count = int(self.m_textCtrl29.GetValue() or 4)
-        old_thread_count = self.shared_config.thread
-
-        # Update only when thread count actually changes
-        if new_thread_count != old_thread_count:
-            self.shared_config.thread = new_thread_count
-            # Immediately refresh thread-pool allocation
-            if hasattr(self, 'video_manager'):
-                self.video_manager.update_thread_count()
+        self._commit_video_settings()
+        if event is not None:
+            event.Skip()
 
     def on_enable_video_mode(self, event):
         prev_video_mode = self.shared_config.video_mode
@@ -2125,15 +2251,8 @@ class MulimgViewer (MulimgViewerGui):
     #     self.shared_config.interval = float(self.m_textCtrl28.GetValue() or 1.0)
     #b1 修改
     def on_interval_changed(self, event):
-        try:
-            new_interval = max(0.05, float(self.m_textCtrl28.GetValue() or 1.0))
-        except (ValueError, TypeError):
-            new_interval = 1.0
-        self.shared_config.interval = new_interval
-        #★ 播放中修改 interval 时，立即重启 timer 使新值生效
-        if getattr(self.shared_config, "is_playing", False):
-            self.play_timer.Stop()
-            self.play_timer.Start(int(new_interval * 1000), oneShot=False)
+        # 统一走 _commit_video_settings (读框 -> 校验 -> 归一化 -> 写回)
+        self._commit_video_settings()
         event.Skip()
 
     def toggle_play(self, event):
@@ -3057,6 +3176,11 @@ class MulimgViewer (MulimgViewerGui):
         if getattr(self, "_parallel_switch_dirty", False):
             self._apply_parallel_switch()
             self._parallel_switch_dirty = False
+        # ★ 先把设置区数值框的内容提交进来, 再往下走。
+        #   以前 refresh() 直接读 shared_config, 而数值框只在"失去焦点"时才写回,
+        #   所以用菜单/快捷键(Ctrl+R)刷新时, 刚改的 Cached Frames 会被静默丢弃。
+        if getattr(self.shared_config, "video_mode", False):
+            self._commit_video_settings()
         if (not getattr(self.shared_config, "video_mode", False)
             and self.out_path_str == ""
             and ((hasattr(self, "show_custom_func") and self.show_custom_func.GetValue())
@@ -3182,6 +3306,10 @@ class MulimgViewer (MulimgViewerGui):
             self.show_img(preserve_text_value=True)
         else:
             self.SetStatusText_(["-1", "", "***Error: First, need to select the input dir***", "-1"])
+        # ★ 刷新完把设置区输入框的光标收掉, 否则框里一直闪着 "|",
+        #   看上去就像刚才那次修改没提交成功。
+        if getattr(self.shared_config, "video_mode", False):
+            self._blur_settings_field()
         self.SetStatusText_(["Refresh", "-1", "-1", "-1"])
 
     def _invalidate_render_cache(self):
