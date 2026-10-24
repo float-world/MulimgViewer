@@ -133,23 +133,19 @@ class MainAPP(wx.App):
 
             self.frame[1] = self.manager.CreateFrame(1)
 
-            paths_to_show = None
+            # ★ 路径列表不再自动填充。
+            #   以前这里在没有显式 input_path 时, 会退回使用"当前已打开的路径"
+            #   (ImgManager.input_path) 或者"上一次手动选择的结果"(_last_manual_paths)
+            #   填进选择框 —— 于是用顺序/并行自动模式打开一个目录后再切到 parallel manual,
+            #   框里会莫名其妙出现当前目录; 关闭时它又被一起提交,
+            #   图片/视频模式来回切换时就会把不该用的路径带进 ImgManager。
+            #   现在列表始终为空: 只有调用方显式传入 input_path 时才会预填。
             if normalized_input:
-                paths_to_show = normalized_input
                 self._last_manual_paths = normalized_input
-            else:
-                img_mgr = getattr(self.frame[0], "ImgManager", None)
-                if img_mgr and getattr(img_mgr, "input_path", None):
-                    paths_to_show = self._normalize_paths(img_mgr.input_path)
-                    self._last_manual_paths = paths_to_show
-                elif self._last_manual_paths:
-                    paths_to_show = self._normalize_paths(self._last_manual_paths)
-
-            if paths_to_show:
                 try:
-                    self.frame[1].refresh_txt(paths_to_show)
+                    self.frame[1].refresh_txt(normalized_input)
                 except AttributeError:
-                    self.frame[1].m_richText1.Value = "\n".join(paths_to_show) + "\n"
+                    self.frame[1].m_richText1.Value = "\n".join(normalized_input) + "\n"
             # 关键：重建后立刻把 vm 注入新实例
             if getattr(self, "video_manager", None) is not None:
                 self.frame[1].set_video_manager(self.video_manager,self.shared_config)

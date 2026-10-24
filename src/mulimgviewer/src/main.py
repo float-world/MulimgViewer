@@ -2915,17 +2915,16 @@ class MulimgViewer (MulimgViewerGui):
 
     def one_dir_mul_dir_manual(self, event):
         self.SetStatusText_(["Input", "", "", "-1"])
-        try:
-            if self.ImgManager.type == 1:
-                input_path = self.ImgManager.input_path
-            else:
-                input_path = None
-        except:
-            input_path = None
+        # ★ 打开 "Parallel manual" 选择窗口时, 路径列表一律为空。
+        #   以前这里会把 ImgManager.input_path(当前已打开的目录, 顺序/并行自动模式选中的那个)
+        #   或者上一次手动选择的结果传过去, 于是选择框里会出现"这次并没有选"的路径。
+        #   用户以为只挑了新目录, 关闭时旧目录却被一起提交,
+        #   在图片/视频模式之间来回切换时尤其容易把路径带错。
+        #   现在不预填: 列表里看到的就是这次真正要用的路径集合。
         if self.shared_config.video_mode:
             self.UpdateUI(1, None, self.parallel_to_sequential.Value ,video_manager = self.video_manager,shared_config=self.shared_config)
         else:
-            self.UpdateUI(1, input_path, self.parallel_to_sequential.Value)
+            self.UpdateUI(1, None, self.parallel_to_sequential.Value)
         self.SetStatusText_(["Input", "-1", "-1", "-1"])
 
     #b5

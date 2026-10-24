@@ -30,15 +30,17 @@ class PathSelectFrame(PathSelectFrameGui):
             self.input_paths = []
 
         self.Layout()
-        if not _PATH_SELECT_STATE["video_mode"] and _PATH_SELECT_STATE["last_manual_paths"]:
-            self.m_richText1.Value = "\n".join(_PATH_SELECT_STATE["last_manual_paths"]) + "\n"
+        # ★ 列表初始为空: 不再恢复上一次手动选择的路径。
+        #   自动填充会让"这一次到底选了哪些路径"变得不明确,
+        #   关闭时旧路径会被一起提交, 图片/视频模式切换时容易用错路径。
+        #   用户在框里看到的内容 = 这次真正会生效的路径集合。
 
     def set_video_manager(self, vm, sh):
         self.video_manager = vm
         self.shared_config = sh
-        if _PATH_SELECT_STATE["video_mode"] and getattr(self.shared_config, "real_video_path", None):
-            paths = list(self.shared_config.real_video_path)
-            wx.CallAfter(self.refresh_txt, paths)
+        # ★ 视频模式下同样不预填当前已加载的视频路径, 列表保持为空。
+        #   在这里挑选的就是"这次要加载的视频集合", 不该混入上一轮的残留。
+
     def frame_resize(self, event):
         self.m_richText1.SetMinSize(wx.Size(self.Size.Width, self.Size.Height))
         self.Layout()
@@ -57,11 +59,17 @@ class PathSelectFrame(PathSelectFrameGui):
         """Collect selected paths, invoke callback, then close the window."""
         paths = [p for p in self.m_richText1.Value.split("\n") if p]
         if _PATH_SELECT_STATE["video_mode"]:
-            self.shared_config.real_video_path = paths if _PATH_SELECT_STATE["video_mode"] else []
-            if self.shared_config.video_mode:
-                self.video_manager.select_video(type=-1)
+            # ★ 列表为空 = 这次没有选任何视频: 保持当前已加载的视频不变。
+            #   以前不管列表是否为空都会覆盖 real_video_path 并重新 select_video(-1),
+            #   于是"打开再关闭"这种空操作也会把视频清空并重建整条视频管线,
+            #   在图片/视频模式之间切换时就会把当前画面弄坏。
+            if paths:
+                if self.shared_config is not None:
+                    self.shared_config.real_video_path = list(paths)
+                if self.video_manager is not None and getattr(self.shared_config, "video_mode", False):
+                    self.video_manager.select_video(type=-1)
         else:
-            _PATH_SELECT_STATE["last_manual_paths"] = paths
+            _PATH_SELECT_STATE["last_manual_paths"] = list(paths)
         if self.get_type() == -1:
             self.Destroy()
         else:
