@@ -111,8 +111,13 @@ class ImgData():
     def get_path_list_from_lf(self):
         format_group = [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]
         if Path(self.input_path).suffix.lower() == '.txt':
-            with open(self.input_path, "r",encoding='utf-8') as f:
-                dataset = f.read().split('\n')
+            # 用 utf-8-sig 读: 兼容记事本保存的 UTF-8 BOM,
+            # 否则第一行会带上 "\ufeff", 整行路径被当成无效路径丢掉。
+            # 逐行 strip: 去掉 Windows 换行留下的 "\r" 和行首尾空格,
+            # 否则 "...\01.jpg\r" 会被判定成"文件不存在", 整份列表被过滤掉。
+            with open(self.input_path, "r", encoding='utf-8-sig') as f:
+                dataset = [line.strip() for line in f.read().split('\n')]
+            dataset = [item for item in dataset if item]
         elif Path(self.input_path).suffix.lower() == '.csv':
             with open(self.input_path, 'r', newline='',encoding='utf-8') as csvfile:
                 dataset = list(csv.reader(csvfile))

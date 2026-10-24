@@ -4412,6 +4412,58 @@ class MulimgViewer (MulimgViewerGui):
             self.SetCursor(wx.Cursor(wx.CURSOR_ARROW))
         self.Refresh()
 
+    def _list_file_signature(self):
+        """图片列表文件(type 3)的内容指纹: 路径 + 字节数 + 修改时间。
+
+        列表文件是用户在外部用编辑器改的, 同一个路径对应的内容随时可能变,
+        所以"要不要作废缓存"不能只看路径, 必须带上内容指纹。
+        """
+        img_mgr = getattr(self, "ImgManager", None)
+        if img_mgr is None or getattr(img_mgr, "type", None) != 3:
+            return None
+        try:
+            list_path = Path(str(getattr(img_mgr, "input_path", "")))
+            if not list_path.is_file():
+                return None
+            stat = list_path.stat()
+            return (str(list_path), int(stat.st_size), int(stat.st_mtime_ns))
+        except Exception:
+            return None
+
+    def _reload_list_file_if_changed(self):
+        """列表文件在外部被改过 -> 重新读取一遍, 并返回当前指纹。
+
+        场景: 用 "Image File List" 打开 1.txt, 之后在外部改了 1.txt 里的图片路径,
+        再重新选择同一个 1.txt (或者直接按刷新) —— 页面必须显示新路径的图片。
+
+        以前 ImgManager 只在第一次 init 时读一次列表, 之后即使重新选择同一个文件
+        也不会重读; 再叠加上拼接结果被缓存住, 于是页面看上去"完全没变化"。
+        这里用文件指纹(大小+修改时间)判断内容是否变化, 变了就重读。
+        """
+        signature = self._list_file_signature()
+        if signature is None:
+            return None
+        last = getattr(self, "_list_file_last_signature", None)
+        self._list_file_last_signature = signature
+        if last is None or last == signature:
+            # 第一次拿到指纹(刚 init 完) 或者 文件内容没变 -> 不需要重读
+            return signature
+        try:
+            self.ImgManager.init(
+                self.ImgManager.input_path,
+                type=3,
+                parallel_to_sequential=bool(
+                    getattr(self.shared_config, "parallel_to_sequential", False)),
+            )
+            self.ImgManager.set_action_count(0)
+            self.shared_config.batch_idx = 0
+            self._debug_image(
+                f"[ImageList] list file changed, reloaded: {self.ImgManager.input_path}")
+        except Exception as ex:
+            if getattr(self.shared_config, "debug_image", False):
+                print(f"[ImageList] reload list file failed: {ex}")
+        return signature
+
     def show_img_init(self):
         # ★ 图片模式下待应用的 parallel / parallel+sequential 切换在这里统一生效。
         #   勾选开关时不做任何重建（避免切换瞬间就重扫目录 + 重拼接），
@@ -4422,13 +4474,21 @@ class MulimgViewer (MulimgViewerGui):
             self._parallel_switch_dirty = False
             self._apply_parallel_switch_image()
 
+        # ★ 列表文件(type 3)可能在外部被改过: 先比指纹, 变了就重新读取一遍。
+        #   这一步放在 set_img_layout() 之前, 保证后面的布局/批数计算用的是最新列表。
+        list_signature = self._reload_list_file_if_changed()
+
         layout_params = self.set_img_layout()
         # ★ 修复：图片模式 + 视频模式 都要在 layout 变化时清空缓存与磁盘缓存文件
         vm = getattr(self, "video_manager", None)
         layout_token = repr(layout_params)
         if not getattr(self.shared_config, "video_mode", False):
+            # ★ 缓存 token 里带上列表文件的内容指纹:
+            #   以前 token 只有 (布局, 类型, 输入路径), 同一个 1.txt 改内容再重新选择时
+            #   token 不变 -> 内存缓存和磁盘 PNG 都不作废 -> 页面还是旧的拼接图。
             image_token = (layout_token, getattr(self.ImgManager, "type", None),
-                           repr(getattr(self.ImgManager, "input_path", None)))
+                           repr(getattr(self.ImgManager, "input_path", None)),
+                           list_signature)
             if image_token != getattr(self, "_image_layout_token", None):
                 with self._image_stitch_lock:
                     self._debug_image(f"[ImageCache] reset, previous_batches={len(self.shared_config.image_cache_img)}")
