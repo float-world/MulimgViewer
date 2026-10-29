@@ -3015,8 +3015,8 @@ class MulimgViewer (MulimgViewerGui):
             if self.shared_config.batch_idx > 0:
                 self.shared_config.batch_idx -= 1
 
-            # ★ 关键：先更新缓存，再展示
-            self.video_manager.update_cache()
+            # ★ 修改：异步更新缓存，让UI立即响应而不是阻塞
+            wx.CallAfter(self.video_manager.update_cache)
 
         if self.shared_config.video_mode:
             if self.ImgManager.img_count != 0:
@@ -3083,9 +3083,10 @@ class MulimgViewer (MulimgViewerGui):
         self.ImgManager.action_count = clamped
         self.ImgManager.img_count = clamped * self.ImgManager.count_per_action
 
-        # In video mode, prepare cache in the background without rendering
+        # ★ 修改：视频模式下，先异步更新缓存，让UI能立即显示已有的缓存
+        #   而不是阻塞等待新缓存生成
         if getattr(self.shared_config, "video_mode", False):
-            self.video_manager.update_cache()
+            wx.CallAfter(self.video_manager.update_cache)
 
         # 刷新显示，保留文本框的值
         self.show_img(preserve_text_value=True)
@@ -3135,8 +3136,12 @@ class MulimgViewer (MulimgViewerGui):
         self.shared_config.batch_idx = clamped
         self.ImgManager.action_count = clamped
         self.ImgManager.img_count = clamped * self.ImgManager.count_per_action
+        
+        # ★ 修改：视频模式下，先异步更新缓存，让UI能立即显示已有的缓存
+        #   而不是阻塞等待新缓存生成
         if self.shared_config.video_mode:
-            self.video_manager.update_cache()
+            # 异步更新缓存（不阻塞UI）
+            wx.CallAfter(self.video_manager.update_cache)
 
         # 刷新显示，保留文本框的值
         self.show_img(preserve_text_value=True)
@@ -6029,8 +6034,8 @@ def main(img_list, save_path, name_list=None, algorithm_name="{algorithm_name}")
             if self.shared_config.batch_idx < int(self.ImgManager.img_num) - 1:
                 self.shared_config.batch_idx += 1
 
-            # ★ 关键：先更新缓存，再展示
-            self.video_manager.update_cache()
+            # ★ 修改：异步更新缓存，让UI立即响应而不是阻塞
+            wx.CallAfter(self.video_manager.update_cache)
 
         if getattr(self.ImgManager, "img_count", 0) < int(self.ImgManager.img_num) - 1:
             self.ImgManager.add()
