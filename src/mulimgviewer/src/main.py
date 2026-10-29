@@ -180,6 +180,7 @@ class VideoManager:
         self.stitch_executor = None
         self._stitch_lock = threading.Lock()
         self._meta_cache = {}
+        self._fast_seek_paths = {}
         self._pending_extract = {}
         self._pending_stitch_async = 0
         self._pending_lock = threading.Lock()
@@ -437,6 +438,7 @@ class VideoManager:
 
         self._last_batch = None
         self._meta_cache.clear()
+        self._fast_seek_paths.clear()
         # 新选的视频: 拼接上下文重新开始, 不再沿用上一批视频的指纹
         self._cache_context = None
         self._cache_context_initialized = False
@@ -796,6 +798,26 @@ class VideoManager:
             # At least allow the first frame to be rendered to prevent the UI from remaining in a permanent "Waiting" state
             total = 1
 
+        # Seeking by timestamp is reliable for ordinary CFR streams whose
+        # reported frame rates and duration agree. Keep uncertain streams on
+        # the absolute-frame path below.
+        try:
+            average_rate = Fraction(vs.get('avg_frame_rate') or '0/1')
+            nominal_rate = Fraction(vs.get('r_frame_rate') or '0/1')
+            reported_frames = int(vs.get('nb_frames') or 0)
+            stream_duration = float(vs.get('duration') or 0)
+            stream_start = float(vs.get('start_time') or 0)
+            self._fast_seek_paths[str(video_path)] = (
+                average_rate > 0
+                and average_rate == nominal_rate
+                and reported_frames > 0
+                and stream_duration > 0
+                and abs(stream_start) < 0.001
+                and abs(reported_frames / fps - stream_duration) <= max(0.1, 2 / fps)
+            )
+        except (TypeError, ValueError, ZeroDivisionError):
+            self._fast_seek_paths[str(video_path)] = False
+
         self._meta_cache[video_path] = (fps, total)
         return self._meta_cache[video_path]
 
@@ -997,8 +1019,6 @@ class VideoManager:
         if window_end < window_start:
             window_end = window_start
 
-        stitch_limit = min(global_b + max(window_radius - 1, 0), global_max_batch - 1)
-
         cache = getattr(self.shared_config, "cache_img", None)
         if cache is None:
             self.shared_config.cache_img = cache = []
@@ -1015,42 +1035,34 @@ class VideoManager:
         extract_threads = getattr(self.executor, "_max_workers", 0)
         stitch_threads = getattr(self.stitch_executor, "_max_workers", 0)
 
-        ##b3 ←旧代码，全部同步，stitch_executor 完全没用上     b5
-        # for t in range(window_start, window_end + 1):
-        #     for vid, max_b in enumerate(max_batches):
-        #         if max_b <= 0 or t >= max_b:
-        #             continue
-        #         wait_for_extract = (t <= stitch_limit)
-        #         self._ensure_batch_extracted(vid, t, wait=wait_for_extract)
-        #     if t <= stitch_limit and cache[t] is None:
-        #         self._stitch_batch_multi(t)
-
-        for t in range(window_start, window_end + 1):
-            is_current_or_past = (t <= global_batch)
-            is_prefetch = (t > global_batch and t <= stitch_limit)
-
-            # 1. 提取阶段
-            extract_futs_for_t = []
+        def queue_extracts(batch):
+            futures = []
             for vid, max_b in enumerate(max_batches):
-                if max_b <= 0 or t >= max_b:
+                if max_b <= 0 or batch >= max_b:
                     continue
-                if is_current_or_past:
-                    # ★ 当前帧/历史帧：同步等待
-                    self._ensure_batch_extracted(vid, t, wait=True)
-                else:
-                    # 未来帧：异步提取
-                    fut = self._ensure_batch_extracted(vid, t, wait=False)
-                    if hasattr(fut, "result"):
-                        extract_futs_for_t.append(fut)
+                result = self._ensure_batch_extracted(vid, batch, wait=False)
+                if isinstance(result, Future):
+                    futures.append(result)
+            return futures
 
-            # 2. 拼接阶段
-            if t <= stitch_limit and self._cached_batch_path(t) is None:
-                if is_current_or_past:
-                    # ★ 当前帧/历史帧：同步拼接
-                    self._stitch_batch_multi(t)
-                else:
-                    # 未来帧：异步拼接
-                    self._schedule_stitch_multi(t, extract_futs_for_t)
+        # Handle the requested batch first. Submit all videos before waiting so
+        # the extraction pool can work on several streams at the same time.
+        if self._cached_batch_path(global_b) is None:
+            target_futures = queue_extracts(global_b)
+            for fut in target_futures:
+                fut.result()
+            self._stitch_batch_multi(global_b)
+
+        # Prefetch in the playback direction. A seek should not synchronously
+        # rebuild earlier batches before the requested frame can be displayed.
+        direction = -1 if getattr(self.shared_config, "play_direction", 1) < 0 else 1
+        for distance in range(1, window_radius + 1):
+            batch = global_b + direction * distance
+            if batch < window_start or batch > window_end:
+                break
+            extract_futures = queue_extracts(batch)
+            if distance < window_radius and self._cached_batch_path(batch) is None:
+                self._schedule_stitch_multi(batch, extract_futures)
 
         for vid, max_b in enumerate(max_batches):
             if max_b <= 0:
@@ -1234,6 +1246,8 @@ class VideoManager:
         #target_size = 256
         #enable_debug_scale = bool(getattr(self.shared_config, "debug_video", False))
         last_error = None
+        owned_tmp_prefixes = []
+        fast_seek = self._fast_seek_paths.get(str(video_path), False)
         has_ffmpeg_input = callable(getattr(ffmpeg, "input", None))
 
         def list_missing(a, b):
@@ -1256,10 +1270,36 @@ class VideoManager:
             out.append((run[0], run[-1]))
             return out
 
-        def extract_ranges(ranges):
+        def extract_ranges(ranges, allow_fast_seek=True):
             nonlocal last_error
             for s, e in ranges:
-                if not has_ffmpeg_input:
+                if fast_seek and allow_fast_seek:
+                    fps = float(self.shared_config.video_fps_list[video_idx])
+                    suffix = f"{os.getpid()}_{threading.get_ident()}_{time.time_ns()}"
+                    tmp_prefix = f"__tmp_{video_idx}_{suffix}_"
+                    owned_tmp_prefixes.append(tmp_prefix)
+                    tmp_tpl = os.path.join(cache_dir, f"{tmp_prefix}%d.jpeg")
+                    cmd = [
+                        "ffmpeg", "-hide_banner", "-loglevel", "error",
+                        "-threads", "1", "-ss", f"{s * step / fps:.9f}",
+                        "-i", str(video_path), "-map", "0:v:0",
+                    ]
+                    if step > 1:
+                        cmd.extend(["-vf", f"select=not(mod(n\\,{step}))"])
+                    cmd.extend([
+                        "-vsync", "0", "-frames:v", str(e - s + 1),
+                        "-q:v", "6", "-start_number", str(s), "-y", tmp_tpl,
+                    ])
+                    try:
+                        cp = subprocess.run(
+                            cmd, capture_output=True, encoding="utf-8",
+                            errors="replace", check=False,
+                        )
+                        if cp.returncode != 0:
+                            last_error = (cp.stderr or cp.stdout or "").strip() or f"ffmpeg exit code {cp.returncode}"
+                    except Exception as ex:
+                        last_error = str(ex)
+                elif not has_ffmpeg_input:
                     fps = float(self.shared_config.video_fps_list[video_idx] or 0)
                     fps_safe = fps if fps > 0 else 25.0
                     for idx in range(s, e + 1):
@@ -1285,50 +1325,52 @@ class VideoManager:
                             last_error = str(ex)
                     continue
 
-                physical_frames = []
-                for logical_idx in range(s, e + 1):
-                    physical_frame = logical_idx * step
-                    physical_frames.append(physical_frame)
-                if not physical_frames:
-                    continue
+                if not (fast_seek and allow_fast_seek):
+                    physical_frames = []
+                    for logical_idx in range(s, e + 1):
+                        physical_frame = logical_idx * step
+                        physical_frames.append(physical_frame)
+                    if not physical_frames:
+                        continue
 
-                if len(physical_frames) == 1:
-                    sel = f'eq(n,{physical_frames[0]})'
-                else:
-                    frame_conditions = [f'eq(n,{pf})' for pf in physical_frames]
-                    sel = '+'.join(frame_conditions)
+                    if len(physical_frames) == 1:
+                        sel = f'eq(n,{physical_frames[0]})'
+                    else:
+                        frame_conditions = [f'eq(n,{pf})' for pf in physical_frames]
+                        sel = '+'.join(frame_conditions)
 
-                suffix = f"{os.getpid()}_{threading.get_ident()}_{int(time.time()*1000)}"
-                tmp_tpl = os.path.join(cache_dir, f'__tmp_{video_idx}_{suffix}_%d.jpeg')
+                    suffix = f"{os.getpid()}_{threading.get_ident()}_{time.time_ns()}"
+                    tmp_prefix = f'__tmp_{video_idx}_{suffix}_'
+                    owned_tmp_prefixes.append(tmp_prefix)
+                    tmp_tpl = os.path.join(cache_dir, f'__tmp_{video_idx}_{suffix}_%d.jpeg')
 
-                try:
-                    # stream = (
-                    #     ffmpeg
-                    #     .input(str(video_path))
-                    #     .filter('select', sel)
-                    # )
-                    # if enable_debug_scale:
-                    #     stream = stream.filter('scale', target_size, -1, force_original_aspect_ratio='decrease')
+                    try:
+                        # stream = (
+                        #     ffmpeg
+                        #     .input(str(video_path))
+                        #     .filter('select', sel)
+                        # )
+                        # if enable_debug_scale:
+                        #     stream = stream.filter('scale', target_size, -1, force_original_aspect_ratio='decrease')
 
-                    #b4 修改
+                        #b4 修改
 
-                    stream = (
-                        ffmpeg
-                        .input(str(video_path))
-                        .filter('select', sel)
-                    )
+                        stream = (
+                            ffmpeg
+                            .input(str(video_path))
+                            .filter('select', sel)
+                        )
 
-                    (
-                        stream
-                        .output(tmp_tpl, vsync='vfr', **{'q:v': 6}, start_number=s)
-                        .global_args('-threads', '1', '-hide_banner', '-loglevel', 'error')
-                        .overwrite_output()
-                        .run(quiet=True)
-                    )
-                except Exception as ex:
-                    last_error = str(ex)
-                    self._debug_video(f"[Extract] error: ffmpeg processing failed, reason={ex}")
-                tmp_prefix = f'__tmp_{video_idx}_{suffix}_'
+                        (
+                            stream
+                            .output(tmp_tpl, vsync='vfr', **{'q:v': 6}, start_number=s)
+                            .global_args('-threads', '1', '-hide_banner', '-loglevel', 'error')
+                            .overwrite_output()
+                            .run(quiet=True)
+                        )
+                    except Exception as ex:
+                        last_error = str(ex)
+                        self._debug_video(f"[Extract] error: ffmpeg processing failed, reason={ex}")
                 tmp_map = {}
                 try:
                     for name in os.listdir(cache_dir):
@@ -1380,7 +1422,9 @@ class VideoManager:
             missing = list_missing(frame_start, frame_end)
             if not missing:
                 break
-            extract_ranges(chunks(missing))
+            # If timestamp seeking did not produce every requested frame,
+            # retry with the original absolute-frame selection.
+            extract_ranges(chunks(missing), allow_fast_seek=False)
             attempt += 1
 
         missing = list_missing(frame_start, frame_end)
@@ -1393,7 +1437,7 @@ class VideoManager:
 
         try:
             for name in os.listdir(cache_dir):
-                if name.startswith(f'__tmp_{video_idx}_') and name.endswith('.jpeg'):
+                if name.endswith('.jpeg') and any(name.startswith(prefix) for prefix in owned_tmp_prefixes):
                     try: os.remove(os.path.join(cache_dir, name))
                     except: pass
         except Exception:
