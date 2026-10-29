@@ -354,12 +354,15 @@ class VideoManager:
         return entry
 
     def _display_cache_ready(self, local_b, base_global, radius, max_batch):
-        """目标批次、前一批、以及前瞻窗口是否都已经有可用的拼接缓存。
+        """窗口 [b-R, b+R] 内的批次是否都已经有可用的拼接缓存。
+
+        ★ 必须检查"整个窗口"(前方 + 历史), 不能只看"前方 + 上一批":
+          - 缓存窗口会随当前位置移动, 尾部的批次会被磁盘清理删掉;
+          - 以前只检查 [b, b+R] 和 b-1, 于是回退到"尾部已被清理"的位置时
+            被误判成"已就绪" -> update_cache 直接短路返回 -> 缺失的那一张
+            永远补不回来 (磁盘上就是少一张的样子)。
 
         全都就绪 -> 这一步不需要做任何缓存维护, 直接显示即可 (见 update_cache 里的短路)。
-        三段都要检查, 少一段都会出问题:
-          - 前瞻 [b, b+R]: 少了它, 跳到未预取的位置会被当成"已就绪"而漏掉预取;
-          - 前一批 b-1: 少了它, 倒放走到没拼过的批次会卡在 Waiting for batch N。
         只要有一段是冷的, 就老老实实走完整流程。
         """
         try:
@@ -376,16 +379,14 @@ class VideoManager:
         def _global(t):
             return (int(base_global) + t) if parallel_to_seq else t
 
+        # ★ 整个窗口 [b-R, b+R] 都要有缓存才算就绪 (尾部历史也要检查)。
+        look_start = max(0, local_b - radius)
         look_end = min(local_b + radius, max_batch - 1)
-        for t in range(local_b, look_end + 1):
+        if look_end < look_start:
+            return False
+        for t in range(look_start, look_end + 1):
             if self._cached_batch_path(_global(t)) is None:
                 return False
-
-        # 视频第一帧的前一批在别的视频里, 索引对不齐, 不在这里判断, 交给完整流程
-        if local_b == 0:
-            return int(base_global) == 0
-        if self._cached_batch_path(_global(local_b - 1)) is None:
-            return False
         return True
 
     def _ui(self):
@@ -933,11 +934,15 @@ class VideoManager:
             self._last_batch = b
             return
 
-        extract_end = min(local_b + R, max_batch - 1)
-        stitch_end = min(local_b + max(R - 1, 0), max_batch - 1)
-        prev_guard = R
-        window_start = max(0, local_b - prev_guard)
-        window_end = extract_end
+        # ★ 窗口口径统一: [b-R, b+R], 前后各 R 个, 共 2R+1 张。
+        #   extract_end / stitch_end / window_start / window_end 必须一致,
+        #   否则会出现"磁盘上少一张"的情况:
+        #     - stitch_end 比 window_end 小 -> 历史帧不拼接 (少一张)
+        #     - 短路检查不含 b-R -> 清理删掉 b-R 后永远补不回来 (少一张)
+        window_start = max(0, local_b - R)
+        window_end = min(local_b + R, max_batch - 1)
+        extract_end = window_end
+        stitch_end = window_end
         extract_threads = getattr(self.executor, "_max_workers", 0)
         stitch_threads = getattr(self.stitch_executor, "_max_workers", 0)
         if not hasattr(self.shared_config, "cache_img") or self.shared_config.cache_img is None:
@@ -953,31 +958,27 @@ class VideoManager:
         # 1. 当前帧：先同步抽帧 + 同步拼接，保证回退/跳页时目标帧立刻可用
         global_local = (base_global + local_b) if parallel_to_seq else local_b
         self._ensure_batch_extracted(video_idx, local_b, wait=True)
-        if local_b <= stitch_end:
-            if self._cached_batch_path(global_local) is None:
-                self._stitch_batch(video_idx, local_b, global_local)
+        if self._cached_batch_path(global_local) is None:
+            self._stitch_batch(video_idx, local_b, global_local)
 
         # 2. 历史帧：命中缓存直接跳过（回退时基本都是命中），未命中才同步补齐，
         #    放在当前帧之后处理，避免为了预热历史帧而拖慢本次显示。
         for t in range(window_start, local_b):  # 不含当前帧
             self._ensure_batch_extracted(video_idx, t, wait=True)
-            if t <= stitch_end:
-                global_t = (base_global + t) if parallel_to_seq else t
-                if self._cached_batch_path(global_t) is None:
-                    self._stitch_batch(video_idx, t, global_t)
-
-        # 3. 未来帧：异步预取
-        for t in range(local_b + 1, extract_end + 1):
             global_t = (base_global + t) if parallel_to_seq else t
-            async_prefetch = (t <= stitch_end)
-            wait_for_extract = not async_prefetch
-            result = self._ensure_batch_extracted(video_idx, t, wait=wait_for_extract)
-            if async_prefetch:
-                if self._should_schedule_stitch(global_t):
-                    if isinstance(result, Future):
-                        result.add_done_callback(partial(self._post_extract_stitch, video_idx, t, global_t))
-                    else:
-                        self._schedule_stitch(video_idx, t, global_t)
+            if self._cached_batch_path(global_t) is None:
+                self._stitch_batch(video_idx, t, global_t)
+
+        # 3. 未来帧：异步抽帧 + 抽完自动拼接
+        #    ★ 整个窗口 [b-R, b+R] 都必须拼接，包括两端。
+        for t in range(local_b + 1, window_end + 1):
+            global_t = (base_global + t) if parallel_to_seq else t
+            result = self._ensure_batch_extracted(video_idx, t, wait=False)
+            if self._should_schedule_stitch(global_t):
+                if isinstance(result, Future):
+                    result.add_done_callback(partial(self._post_extract_stitch, video_idx, t, global_t))
+                else:
+                    self._schedule_stitch(video_idx, t, global_t)
 
         start_tuple = self._batch_range(n, k, window_start)
         end_tuple = self._batch_range(n, k, window_end)
@@ -987,8 +988,15 @@ class VideoManager:
         self._debug_video(f"[CacheSchedule] done batch={b} window=[{window_start},{window_end}] extract_threads={extract_threads} stitch_threads={stitch_threads} keep_frame_range=[{keep_start_idx},{keep_end_idx})")
 
         # **清理窗口外的磁盘缓存**
-        # 用户期望窗口: [local_b - R, local_b + R] (2R+1 张, 含历史帧)
-        self._cleanup_disk_cache_out_of_window(int(window_start), int(window_end))
+        # 用户期望窗口: [b-R, b+R] (2R+1 张, 含历史帧)
+        # ★ 磁盘文件名用的是"全局批次号":
+        #     - 普通单视频: 局部号 == 全局号
+        #     - 并行转串行: 全局号 = base_global + 局部号
+        #   清理范围必须用全局号算, 否则会删掉刚写好的文件 / 留下该删的文件。
+        #   同时要用 window_end (已按视频长度截断), 保证收尾帧附近的范围不会溢出。
+        disk_lo = (base_global + window_start) if parallel_to_seq else window_start
+        disk_hi = (base_global + window_end) if parallel_to_seq else window_end
+        self._cleanup_disk_cache_out_of_window(int(disk_lo), int(disk_hi))
         self._last_batch = b
         self._mark_batch_processed()
 
@@ -1053,16 +1061,17 @@ class VideoManager:
                 fut.result()
             self._stitch_batch_multi(global_b)
 
-        # Prefetch in the playback direction. A seek should not synchronously
-        # rebuild earlier batches before the requested frame can be displayed.
-        direction = -1 if getattr(self.shared_config, "play_direction", 1) < 0 else 1
-        for distance in range(1, window_radius + 1):
-            batch = global_b + direction * distance
-            if batch < window_start or batch > window_end:
-                break
+        # Prefetch the whole window [global_b - R, global_b + R].
+        # ★ 以前只沿播放方向预取, 而且最远端 (distance == window_radius) 只抽帧不拼接,
+        #   于是磁盘上的拼接图永远比窗口少一张。这里改成整个窗口都排上拼接任务,
+        #   方向无关, 全部异步, 不阻塞当前帧显示。
+        for batch in range(window_start, window_end + 1):
+            if batch == global_b:
+                continue
+            if self._cached_batch_path(batch) is not None:
+                continue
             extract_futures = queue_extracts(batch)
-            if distance < window_radius and self._cached_batch_path(batch) is None:
-                self._schedule_stitch_multi(batch, extract_futures)
+            self._schedule_stitch_multi(batch, extract_futures)
 
         for vid, max_b in enumerate(max_batches):
             if max_b <= 0:
